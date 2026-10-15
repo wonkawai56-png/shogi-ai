@@ -5,7 +5,7 @@
  *   activate 古い版の cache を消し、開いているページを引き受ける（ページの側は1回だけ読み直す）
  *   fetch    一式の中の物は cache から返す（ページを開くとき・アイコンなど）。無い物だけネットへ */
 'use strict';
-const VERSION = "b2818d88f6ac";
+const VERSION = "1e94160fd25c";
 const ASSETS = [
   "./",
   "./index.html",
@@ -28,7 +28,7 @@ async function fetchFresh(url) {
   return new Response(await res.blob(), { status: res.status, statusText: res.statusText, headers: res.headers });
 }
 
-// './'（開くときの URL）と './index.html' は同じページ（約 3.8MB）。取るのは1回だけにして、両方の鍵で入れる
+// './'（開くときの URL）と './index.html' は同じページ（大きい）。取るのは1回だけにして、両方の鍵で入れる
 self.addEventListener('install', (event) => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE);
