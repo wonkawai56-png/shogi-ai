@@ -3,9 +3,10 @@
  * 版（VERSION）は一式の中身から決まる。公開を更新すると sw.js も変わり、ブラウザが新しい版を取り込む：
  *   install  新しい版の cache に一式を取り直して入れ、待たずに入れ替わる（skipWaiting）
  *   activate 古い版の cache を消し、開いているページを引き受ける（ページの側は1回だけ読み直す）
- *   fetch    一式の中の物は cache から返す（ページを開くとき・アイコンなど）。無い物だけネットへ */
+ *   fetch    一式の中の物は cache から返す（ページを開くとき・アイコンなど）。無い物だけネットへ。
+ *            どちらの応答にも COOP・COEP の見出しを付け直す（クロスオリジン分離。並列の読みのため） */
 'use strict';
-const VERSION = "1e94160fd25c";
+const VERSION = "6796802f3833";
 const ASSETS = [
   "./",
   "./index.html",
@@ -18,6 +19,16 @@ const ASSETS = [
 
 const PREFIX = 'shogi-ai-';
 const CACHE = PREFIX + VERSION;
+
+// クロスオリジン分離（設計 §15）：自分のページへの応答に COOP・COEP の見出しを付け直す（GitHub Pages では付けられないため）。
+// 分離されたページでは SharedArrayBuffer が使え、AI が複数の Worker で並列に読む。中身は変えない。
+const COI = { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp' };
+function withCoi(res) {
+  if (!res || res.type === 'opaque' || res.type === 'opaqueredirect' || !(res.status >= 200 && res.status <= 599)) return res;
+  const headers = new Headers(res.headers);
+  for (const k of Object.keys(COI)) headers.set(k, COI[k]);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
 
 // 取り直すときは HTTP の cache を通さない（古い版を新しい版の名前で入れないため）。
 // 転送（redirect）を経た応答は、ページを開く応答に使えないので中身だけの応答に作り直す。
@@ -62,6 +73,6 @@ self.addEventListener('fetch', (event) => {
     const hit = isPage
       ? (await cache.match('./')) || (await cache.match('./index.html'))
       : await cache.match(req, { ignoreSearch: true });
-    return hit || fetch(req);
+    return withCoi(hit || (await fetch(req)));
   })());
 });

@@ -2436,6 +2436,7 @@ select {
 /* 評価関数・探索・強さの段階（→ ShogiSearch）
  * 反復深化・PVS・置換表・null move・ProbCut・singular extension・LMR（履歴で調整）・LMP・futility・SEE による枝刈り・
  * 静止探索・1手詰め・王手延長・続きの履歴。外部の評価データは使わない（評価は setEvaluator で差し替えられる）。
+ * 並列の読み（共有の置換表を持つ複数の Worker が同じ局面を読む。ShogiSearch.SMP。設計 §15）。
  * 変更ごとの比べ方と数字は docs/読みの改良.md。 */
 (function (root, factory) {
   const api = factory(root);
@@ -2633,9 +2634,13 @@ select {
   const MAX_PLY = 100, MAXM = 640;
   const INF = 1000000, MATE = 100000, MATE_BOUND = MATE - 2000, PERP = 50000, NO_REP = 0x7fffffff;
   const EXACT = 1, LOWER = 2, UPPER = 3;
-  // 置換表の大きさ（2 の TT_BITS 乗の欄。1欄 16 バイト。既定は 2^21 欄＝32MB）
+  // 置換表の大きさ（2 の TT_BITS 乗の欄。1欄 16 バイト。既定は 2^21 欄＝32MB）。
+  // 1欄は 32 ビットの数 4つ：[検算の値, 手, 評価値, 情報（深さ | 種類<<8 | 世代<<10）]。
+  // 検算の値 ＝ 鍵（局面のハッシュの上位 32 ビット）^ 手 ^ 評価値 ^ 情報。読むときは 4つを XOR して鍵と比べる。
+  // 並列の読み（複数の Worker が1つの表を分け合う）で、2つの書き込みが混ざった欄は鍵が合わなくなるので使われない。
+  // 1本で読むときも同じ作り（覚える値も読み方も前と同じ。並べ方を1本の配列にまとめただけ）。
   let TT_BITS = 0, TT_SIZE = 0, TT_MASK = 0;
-  let ttKey = null, ttMove = null, ttScore = null, ttInfo = null, ttGen = 0;
+  let TT = null, ttGen = 0;
 
   const moveBuf = new Int32Array(MAX_PLY * MAXM), scoreBuf = new Int32Array(MAX_PLY * MAXM);
   const pvTab = new Int32Array(MAX_PLY * MAX_PLY), pvLen = new Int32Array(MAX_PLY);
@@ -2677,35 +2682,42 @@ select {
   let partialMove = 0, partialScore = 0, partialPv = [];
 
   // 置換表を用意する。メモリが足りない環境では小さくして続ける（2^16 欄まで。それより小さい指定はそのまま）
+  // 共有の置換表をつないでいる間（並列の読み。下の「並列の読み」の節）は、自分では用意しない。
   let ttWant = 0;
   function ttAlloc(bits) {
-    if (ttKey && bits === ttWant) return;
+    if (shCtl !== null) return;
+    if (TT && bits === ttWant) return;
     ttWant = bits;
     for (let b = bits, lo = Math.min(bits, 16); b >= lo; b--) {
       try {
         const n = 1 << b;
-        const k = new Int32Array(n), mv = new Int32Array(n), sc = new Int32Array(n), inf = new Int32Array(n);
-        ttKey = k; ttMove = mv; ttScore = sc; ttInfo = inf;
+        TT = new Int32Array(n * 4);
         TT_BITS = b; TT_SIZE = n; TT_MASK = n - 1;
         return;
       } catch (e) { /* 小さくしてやり直す */ }
     }
     throw new Error('置換表のメモリを用意できません');
   }
-  function clearHash() {
-    if (!ttKey) return;
-    ttKey.fill(0); ttMove.fill(0); ttScore.fill(0); ttInfo.fill(0);
+  // 手の並べ方の覚え（履歴・続きの履歴・応手）を消す。置換表は消さない
+  function clearTables() {
     history.fill(0); cont1.fill(0); cont2.fill(0); counterMove.fill(0);
+  }
+  function clearHash() {
+    if (!TT) return;
+    TT.fill(0);
+    clearTables();
   }
 
   function ttStore(ti, key, m, sc, depth, bound, ply) {
-    const info = ttInfo[ti];
-    if (ttKey[ti] !== key && (info >>> 10) === ttGen && (info & 255) > depth + 2) return;
+    const b = ti << 2;
+    const om = TT[b + 1], os = TT[b + 2], oi = TT[b + 3];
+    const same = (TT[b] ^ om ^ os ^ oi) === key;
+    if (!same && (oi >>> 10) === ttGen && (oi & 255) > depth + 2) return;
     if (sc > MATE_BOUND) sc += ply; else if (sc < -MATE_BOUND) sc -= ply;
-    if (m !== 0 || ttKey[ti] !== key) ttMove[ti] = m;
-    ttKey[ti] = key;
-    ttScore[ti] = sc;
-    ttInfo[ti] = (depth < 0 ? 0 : depth > 255 ? 255 : depth) | (bound << 8) | (ttGen << 10);
+    const nm = (m !== 0 || !same) ? m : om;
+    const ni = (depth < 0 ? 0 : depth > 255 ? 255 : depth) | (bound << 8) | (ttGen << 10);
+    TT[b + 1] = nm; TT[b + 2] = sc; TT[b + 3] = ni;
+    TT[b] = key ^ nm ^ sc ^ ni;
   }
 
   // 千日手：同じ局面が前にあれば、引き分け（0）か連続王手の勝ち負けを返す
@@ -2857,6 +2869,13 @@ select {
 
   function checkTime() {
     if (canStop && (nodes >= nodeLimit || now() >= hardLimit)) stopFlag = true;
+    if (shCtl !== null) {
+      // 並列の読み：手伝いは局面数を欄に書き、主の「止める合図」を見る。主は本体の「止めて」を見る
+      if (jobSeq !== 0) {
+        Atomics.store(shCtl, SLOT0 + smpIndex * SLOT + F_NODES, nodes < 0x7fffffff ? nodes : 0x7fffffff);
+        if (Atomics.load(shCtl, C_STOP) >= jobSeq) stopFlag = true;
+      } else if (abortId !== 0 && Atomics.load(shCtl, C_ABORT) >= abortId) stopFlag = true;
+    }
   }
 
   // 静止探索（駒を取る手・成る手。王手されていれば全部の逃げ方）
@@ -2921,15 +2940,17 @@ select {
   // search({ tune: {...} }) で一時的に変えられる（比べる対局のため。画面からは使わない）。既定は採用した設定。
   // se：singular extension／chk：王手延長（0＝すべての王手、1＝取る手か SEE で損をしない王手だけ、2＝しない）／
   // m1d：1手詰めを調べる最小の深さ／ecache：評価値の覚え書き／lsort：残りの手をまとめて並べ替える／
-  // cont：続きの履歴／dropord：打つ手の並べ方／pc：ProbCut／tm：時間の使い方／lmr：LMR の表の割る数／ttbits：置換表の大きさ
-  const TUNE_DEFAULT = { se: true, chk: 1, m1d: 3, ecache: true, lsort: true, cont: true, dropord: true, pc: true, tm: true, lmr: 2.2, ttbits: 21 };
-  let T_se = true, T_chk = 1, T_m1d = 3, T_lsort = true, T_cont = true, T_dropord = true, T_pc = true, T_tm = true, T_ttbits = 21;
+  // cont：続きの履歴／dropord：打つ手の並べ方／pc：ProbCut／tm：時間の使い方／lmr：LMR の表の割る数／ttbits：置換表の大きさ／
+  // smpskip：並列の読みで、手伝いが読む深さを手伝いごとにずらして間引く（false＝全員がすべての深さを読む）
+  const TUNE_DEFAULT = { se: true, chk: 1, m1d: 3, ecache: true, lsort: true, cont: true, dropord: true, pc: true, tm: true, lmr: 2.2, ttbits: 21, smpskip: true };
+  let T_se = true, T_chk = 1, T_m1d = 3, T_lsort = true, T_cont = true, T_dropord = true, T_pc = true, T_tm = true, T_ttbits = 21, T_smpskip = true;
   function setTune(t) {
     const u = Object.assign({}, TUNE_DEFAULT, t || {});
     T_se = !!u.se; T_chk = u.chk | 0; T_m1d = Number.isInteger(u.m1d) ? u.m1d : 3;
     ecOn = !!u.ecache; T_lsort = !!u.lsort; T_cont = u.cont !== false; T_dropord = !!u.dropord; T_pc = !!u.pc; T_tm = !!u.tm;
     buildLmr(Number(u.lmr) > 0.5 ? Number(u.lmr) : 2.2);
     T_ttbits = Number.isInteger(u.ttbits) && u.ttbits >= 10 && u.ttbits <= 24 ? u.ttbits : 21;
+    T_smpskip = u.smpskip !== false;
   }
   const excluded = new Int32Array(MAX_PLY + 4);   // singular extension の確かめで外す手
 
@@ -2954,13 +2975,13 @@ select {
     const excl = excluded[ply];
 
     // 置換表
-    const ti = p.hashLo & TT_MASK, key = p.hashHi;
+    const ti = p.hashLo & TT_MASK, key = p.hashHi, tb = ti << 2;
     let ttm = 0, ttD = -1, ttB = 0, ttSc = 0;
-    if (ttKey[ti] === key) {
-      ttm = ttMove[ti];
-      const info = ttInfo[ti];
+    const e1 = TT[tb + 1], e2 = TT[tb + 2], info = TT[tb + 3];
+    if ((TT[tb] ^ e1 ^ e2 ^ info) === key) {
+      ttm = e1;
       ttD = info & 255; ttB = (info >> 8) & 3;
-      ttSc = ttScore[ti];
+      ttSc = e2;
       if (ttSc > MATE_BOUND) ttSc -= ply; else if (ttSc < -MATE_BOUND) ttSc += ply;
       if (!pvNode && excl === 0 && ttD >= depth) {
         if (ttB === EXACT || (ttB === LOWER && ttSc >= beta) || (ttB === UPPER && ttSc <= alpha)) return ttSc;
@@ -3181,16 +3202,17 @@ select {
   // book：定跡を使う（つなぎ口 a）。mateSearch：詰み探索を先に呼ぶ（つなぎ口 b。持ち時間の mateShare まで）。
   // bookPick：定跡の手の選び方（chooseBook）。'count'＝出現数に比例してばらつく／'good'＝勝率の悪い手を軽くしてばらつく／'best'＝出現数と勝率で一番よい手
   // mateShare：詰み探索に使う持ち時間の割合
+  // parallel：並列の読み（Lv4〜7）。ページがクロスオリジン分離されていて、手伝いの Worker がつながっているときだけ働く（下の「並列の読み」の節）。
   // learnedEval：学習した評価を使う（Lv3〜7。1手0.5秒の対局 160 局で手書きの評価に 110勝50敗。docs/検証記録.md の v2-2）。
   //   Lv1・2 は覚えたての人向けの段階で、ゆらぎの幅を手書きの評価に合わせてあるので手書きのまま。
   const LEVELS = [
     { level: 1, name: '入門', desc: '1手先と駒の取り合いだけ読む。ときどき緩む', maxDepth: 1, timeMs: 3000, noise: 250, blunder: 0.2, resign: false, book: false, mateSearch: false },
     { level: 2, name: '初級', desc: '2手先まで読む。少しゆらぎあり', maxDepth: 2, timeMs: 3000, noise: 120, blunder: 0, resign: false, book: false, mateSearch: false },
     { level: 3, name: '中級', desc: '0.4秒考える。序盤は定跡をいろいろ指す。ほんの少しゆらぎあり', maxDepth: 64, timeMs: 400, noise: 40, blunder: 0, resign: true, book: true, bookPick: 'count', mateSearch: false, learnedEval: true },
-    { level: 4, name: '上級', desc: '1秒まで考える。長い詰みも探す', maxDepth: 64, timeMs: 1000, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'count', mateSearch: true, mateShare: 0.1, learnedEval: true },
-    { level: 5, name: '有段', desc: '2.5秒まで考える。定跡は勝率のよい手を多めに', maxDepth: 64, timeMs: 2500, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'good', mateSearch: true, mateShare: 0.1, learnedEval: true },
-    { level: 6, name: '高段', desc: '5秒まで考える', maxDepth: 64, timeMs: 5000, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'good', mateSearch: true, mateShare: 0.1, learnedEval: true },
-    { level: 7, name: '最強', desc: '10秒まで考える。定跡は勝率のよい手だけ', maxDepth: 64, timeMs: 10000, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'best', mateSearch: true, mateShare: 0.1, learnedEval: true },
+    { level: 4, name: '上級', desc: '1秒まで考える。長い詰みも探す', maxDepth: 64, timeMs: 1000, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'count', mateSearch: true, mateShare: 0.1, learnedEval: true, parallel: true },
+    { level: 5, name: '有段', desc: '2.5秒まで考える。定跡は勝率のよい手を多めに', maxDepth: 64, timeMs: 2500, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'good', mateSearch: true, mateShare: 0.1, learnedEval: true, parallel: true },
+    { level: 6, name: '高段', desc: '5秒まで考える', maxDepth: 64, timeMs: 5000, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'good', mateSearch: true, mateShare: 0.1, learnedEval: true, parallel: true },
+    { level: 7, name: '最強', desc: '10秒まで考える。定跡は勝率のよい手だけ', maxDepth: 64, timeMs: 10000, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'best', mateSearch: true, mateShare: 0.1, learnedEval: true, parallel: true },
   ];
 
   // ===== 定跡・詰み探索のつなぎ口（a・b）=====
@@ -3334,9 +3356,224 @@ select {
     return { usi: u, pv: pv && pv.length && pv[0] === u ? pv : [u], plies };
   }
 
+  // ===== 並列の読み（複数の Worker が1つの置換表を分け合い、同じ局面を少しずつ違う深さで読む。考え方は Lazy SMP）=====
+  // 本体（ページ・Node）が SMP.create で共有の表（SharedArrayBuffer）を2つ作り、Worker ごとに SMP.attach でつなぐ。
+  //   tt  ：置換表（1欄 16 バイト × 2^ttBits 欄）。主と手伝いがそのまま読み書きする（欄の検算は ttStore の上の説明）
+  //   ctl ：合図と結果の欄（Int32）と、仕事の中身（局面と設定の JSON。Uint16）
+  // 役目は2つ。主（index 0）は今までどおり go を受けて読み、手伝いに仕事を出して、時間が来たら止める。
+  // 手伝い（index 1〜）は SMP.helperLoop の中で仕事を待ち（Atomics.wait）、出たら同じ局面を読み、深さを1つ読み切るごとに結果を欄に書く。
+  // 主は最後に、いちばん深く読み切った結果を選ぶ（詰みを読み切った結果があれば、いちばん短い詰み）。手は主の合法手の中にある物だけ使う。
+  const SMP_MAX = 8;                       // つなげる Worker の数の上限（主を含む）
+  const C_SEARCH = 0, C_STOP = 1, C_ABORT = 2, C_JOBSEQ = 3, C_JOBLEN = 4, C_QUIT = 5;
+  const SLOT0 = 16, SLOT = 80, PVMAX = 64; // 手伝い k の欄は SLOT0 + k × SLOT から
+  const F_STATE = 0, F_SEQ = 1, F_JOB = 2, F_DEPTH = 3, F_SCORE = 4, F_MOVE = 5, F_PVLEN = 6, F_NODES = 7, F_PV = 8;
+  const ST_NONE = 0, ST_IDLE = 1, ST_BUSY = 2, ST_DEAD = 3;
+  const CTL_INTS = SLOT0 + SMP_MAX * SLOT;
+  const JOB_CHARS = 1 << 14;
+  const CTL_BYTES = CTL_INTS * 4 + JOB_CHARS * 2;
+  // 手伝いが読む深さの間引き（手伝いごとに、読む深さと飛ばす深さの並びをずらす。同じ深さを全員で読むと重なりが多い）
+  const SKIP_SIZE = [1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4];
+  const SKIP_PHASE = [0, 1, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7];
+  function smpSkip(d, idx) {
+    const i = (idx - 1) % 20;
+    return ((((d + SKIP_PHASE[i]) / SKIP_SIZE[i]) | 0) & 1) === 1;
+  }
+
+  let shCtl = null, shJob = null, smpRole = '', smpIndex = 0;
+  let jobSeq = 0;     // 手伝い：今読んでいる仕事の番号（0＝なし）
+  let abortId = 0;    // 主：この番号以上の「止めて」が本体から来たら止める（0＝見ない）
+
+  const isSab = (x) => Object.prototype.toString.call(x) === '[object SharedArrayBuffer]';
+  const ctlView = (ctl) => new Int32Array(ctl, 0, CTL_INTS);
+  const slotOf = (k) => SLOT0 + k * SLOT;
+
+  // 共有の表を作る（本体で1回）。SharedArrayBuffer が使えない環境（ページがクロスオリジン分離されていない等）では null。
+  // 置換表が取れなければ半分ずつ小さくする（2^16 欄まで）。
+  function smpCreate(opts) {
+    if (typeof SharedArrayBuffer !== 'function' || typeof Atomics !== 'object') return null;
+    const want = opts && Number.isInteger(opts.ttBits) ? Math.max(16, Math.min(24, opts.ttBits)) : 21;
+    for (let b = want; b >= 16; b--) {
+      let tt = null, ctl = null;
+      try { tt = new SharedArrayBuffer((1 << b) * 16); ctl = new SharedArrayBuffer(CTL_BYTES); } catch (e) { continue; }
+      return { tt, ctl, ttBits: b };
+    }
+    return null;
+  }
+
+  // この Worker（またはモジュール）を共有の表につなぐ。role は 'main'（主）か 'helper'（手伝い。index 1〜SMP_MAX−1）
+  function smpAttach(o) {
+    if (!o || !isSab(o.tt) || !isSab(o.ctl)) throw new Error('共有の表（SharedArrayBuffer）がありません');
+    if (o.ctl.byteLength !== CTL_BYTES) throw new Error('合図の欄の大きさが違います');
+    const n = o.tt.byteLength / 16;
+    if (!(n >= 1024) || (n & (n - 1)) !== 0) throw new Error('置換表の大きさが 2 の累乗の欄ではありません');
+    const role = o.role === 'helper' ? 'helper' : 'main';
+    const idx = role === 'helper' ? Number(o.index) : 0;
+    if (role === 'helper' && !(Number.isInteger(idx) && idx >= 1 && idx < SMP_MAX)) throw new Error('手伝いの番号が不正です: ' + o.index);
+    TT = new Int32Array(o.tt);
+    TT_SIZE = n; TT_MASK = n - 1; TT_BITS = Math.round(Math.log2(n)); ttWant = -1;
+    shCtl = ctlView(o.ctl);
+    shJob = new Uint16Array(o.ctl, CTL_INTS * 4, JOB_CHARS);
+    smpRole = role; smpIndex = idx;
+    return { role, index: idx, ttBits: TT_BITS };
+  }
+  // つなぐのをやめる（テスト用。次の search から自分の置換表を作り直す）
+  function smpDetach() {
+    shCtl = null; shJob = null; smpRole = ''; smpIndex = 0; jobSeq = 0; abortId = 0;
+    TT = null; ttWant = 0;
+  }
+
+  // 本体から：読んでいる go（番号 id 以下）を止めてもらう。主は 1024 局面ごとに見て止まり、手伝いも止める
+  function smpAbort(ctl, id) { const a = ctlView(ctl); if (Atomics.load(a, C_ABORT) < id) Atomics.store(a, C_ABORT, id); }
+  // 本体から：落ちた手伝い（terminate した物）を使わない印
+  function smpMarkDead(ctl, k) { const a = ctlView(ctl); Atomics.store(a, slotOf(k) + F_STATE, ST_DEAD); Atomics.notify(a, slotOf(k) + F_STATE); }
+  // 本体から：手伝いの待ち受けを終わらせる（テストの後片付け。ページでは terminate で足りる）
+  function smpQuit(ctl) { const a = ctlView(ctl); Atomics.store(a, C_QUIT, 1); Atomics.notify(a, C_SEARCH); }
+  // 確かめ用：手伝いの状態（0 なし・1 待ち・2 読んでいる・3 落ちた）
+  function smpStates(ctl) { const a = ctlView(ctl), r = []; for (let k = 1; k < SMP_MAX; k++) r.push(Atomics.load(a, slotOf(k) + F_STATE)); return r; }
+
+  // 主：使える手伝い（待っている・読み終わりかけ）の番号
+  function smpLiveHelpers() {
+    const r = [];
+    for (let k = 1; k < SMP_MAX; k++) {
+      const s = Atomics.load(shCtl, slotOf(k) + F_STATE);
+      if (s === ST_IDLE || s === ST_BUSY) r.push(k);
+    }
+    return r;
+  }
+
+  // 主：仕事を出す（局面と設定を JSON で書き、番号を進めて手伝いを起こす）。出せなければ 0
+  function smpWriteJob(job) {
+    const seq = Atomics.load(shCtl, C_SEARCH) + 1;
+    job.seq = seq;
+    const s = JSON.stringify(job);
+    if (s.length > JOB_CHARS) return 0;
+    for (let i = 0; i < s.length; i++) shJob[i] = s.charCodeAt(i);
+    Atomics.store(shCtl, C_JOBLEN, s.length);
+    Atomics.store(shCtl, C_JOBSEQ, seq);
+    Atomics.store(shCtl, C_SEARCH, seq);
+    Atomics.notify(shCtl, C_SEARCH);
+    return seq;
+  }
+  // 手伝い：仕事を読む（読んでいる間に次の仕事に書き換わったら null）
+  function smpReadJob(seq) {
+    if (Atomics.load(shCtl, C_JOBSEQ) !== seq) return null;
+    const len = Atomics.load(shCtl, C_JOBLEN);
+    if (!(len > 0 && len <= JOB_CHARS)) return null;
+    let s = '';
+    for (let i = 0; i < len; i += 4096) s += String.fromCharCode.apply(null, shJob.slice(i, Math.min(len, i + 4096)));
+    if (Atomics.load(shCtl, C_JOBSEQ) !== seq) return null;
+    try { const j = JSON.parse(s); return j && j.seq === seq ? j : null; } catch (e) { return null; }
+  }
+
+  // 手伝い：結果の欄に書く（版の数 F_SEQ を奇数にしてから書き、偶数に戻す。読む側は版の数が変わらなかったときだけ使う）
+  function smpPublish(seq, depth, score, move, pvN) {
+    const b = slotOf(smpIndex), a = shCtl;
+    const v = Atomics.load(a, b + F_SEQ);
+    Atomics.store(a, b + F_SEQ, (v + 1) | 1);
+    Atomics.store(a, b + F_JOB, seq);
+    Atomics.store(a, b + F_DEPTH, depth);
+    Atomics.store(a, b + F_SCORE, score);
+    Atomics.store(a, b + F_MOVE, move);
+    const n = pvN < PVMAX ? pvN : PVMAX;
+    for (let i = 0; i < n; i++) Atomics.store(a, b + F_PV + i, pvTab[i]);
+    Atomics.store(a, b + F_PVLEN, n);
+    Atomics.store(a, b + F_SEQ, ((v + 1) | 1) + 1);
+  }
+  // 主：手伝い k の結果（仕事 seq のもので、深さを1つ以上読み切っていれば）
+  function smpReadSlot(k, seq) {
+    const b = slotOf(k), a = shCtl;
+    for (let t = 0; t < 1000; t++) {
+      const v1 = Atomics.load(a, b + F_SEQ);
+      if (v1 & 1) continue;
+      const job = Atomics.load(a, b + F_JOB), depth = Atomics.load(a, b + F_DEPTH), score = Atomics.load(a, b + F_SCORE);
+      const move = Atomics.load(a, b + F_MOVE), n = Math.min(PVMAX, Atomics.load(a, b + F_PVLEN));
+      const pv = [];
+      for (let i = 0; i < n; i++) pv.push(Atomics.load(a, b + F_PV + i));
+      if (Atomics.load(a, b + F_SEQ) !== v1) continue;
+      return job === seq && depth > 0 ? { k, depth, score, move, pv } : null;
+    }
+    return null;
+  }
+  // 主：仕事 seq を読んでいる手伝いの局面数の合計
+  function smpHelperNodes(seq) {
+    let t = 0;
+    for (let k = 1; k < SMP_MAX; k++) {
+      const b = slotOf(k);
+      if (Atomics.load(shCtl, b + F_JOB) === seq) t += Atomics.load(shCtl, b + F_NODES);
+    }
+    return t;
+  }
+  // 主：手伝いを止めて、読み終わるのを少し待つ（多くて 0.3 秒）。手伝いの結果と局面数を返す
+  function smpFinish(seq) {
+    Atomics.store(shCtl, C_STOP, seq);
+    const deadline = now() + 300;
+    for (let k = 1; k < SMP_MAX; k++) {
+      const st = slotOf(k) + F_STATE;
+      while (Atomics.load(shCtl, st) === ST_BUSY) {
+        const left = deadline - now();
+        if (left <= 0) break;
+        try { Atomics.wait(shCtl, st, ST_BUSY, Math.min(50, left)); } catch (e) { /* 待てないスレッド（ブラウザの本体）では見回すだけ */ }
+      }
+    }
+    const res = [];
+    for (let k = 1; k < SMP_MAX; k++) { const r = smpReadSlot(k, seq); if (r) res.push(r); }
+    return { res, nodes: smpHelperNodes(seq) };
+  }
+  // 主：手伝いの読み筋を、この局面で1手ずつ確かめて USI にする（指せない手が出たらそこまで。局面は元に戻す）
+  function smpPvUsi(p, pv) {
+    const out = [], done = [];
+    for (let i = 0; i < pv.length; i++) {
+      const u = moveToUsi(pv[i]);
+      const f = p.findMove(u);
+      if (f === 0) break;
+      out.push(u);
+      p.makeMove(f);
+      done.push(f);
+    }
+    while (done.length) p.unmakeMove(done.pop());
+    return out.length ? out : [moveToUsi(pv[0])];
+  }
+  // 結果 a が今の候補 b より良いか（詰みを読み切った結果は短いほど良い。ほかは深いほど良い。同じ深さなら主の結果のまま）
+  function smpBetter(a, b) {
+    if (a.score >= MATE_BOUND || b.score >= MATE_BOUND) return a.score > b.score;
+    if (a.depth !== b.depth) return a.depth > b.depth;
+    return !b.main && a.score > b.score;
+  }
+
+  // 手伝い：仕事を待ち、出たら読む（戻らない。止めるのは本体の terminate か smpQuit）
+  function smpHelperLoop() {
+    if (smpRole !== 'helper' || shCtl === null) throw new Error('手伝いとしてつないでいません');
+    const a = shCtl, st = slotOf(smpIndex) + F_STATE;
+    Atomics.store(a, st, ST_IDLE);
+    Atomics.notify(a, st);
+    let last = 0;
+    for (;;) {
+      if (Atomics.load(a, C_QUIT) !== 0) return;
+      const seq = Atomics.load(a, C_SEARCH);
+      if (seq === last) { Atomics.wait(a, C_SEARCH, seq, 10000); continue; }
+      last = seq;
+      if (Atomics.load(a, C_STOP) >= seq) continue;
+      const job = smpReadJob(seq);
+      if (!job || smpIndex > (job.maxIdx | 0)) continue;
+      Atomics.store(a, st, ST_BUSY);
+      // 主は「止める合図 → 状態を見る」、手伝いは「状態を書く → 止める合図を見る」の順なので、どちらかが必ず相手に気づく
+      if (Atomics.load(a, C_STOP) < seq) {
+        try {
+          search({ startSfen: job.startSfen, moves: job.moves, level: job.level, learnedEval: !!job.learned, tune: job.tune || undefined,
+            maxDepth: job.maxDepth, timeMs: job.cap, clearHash: !!job.clear, book: false, mateSearch: false, _helper: job });
+        } catch (e) { /* 手伝いの失敗は主の結果に響かせない */ }
+      }
+      jobSeq = 0;
+      Atomics.store(a, st, ST_IDLE);
+      Atomics.notify(a, st);
+    }
+  }
+
   function search(opts) {
     const o = opts || {};
     const t0 = now();
+    // 手伝いとして読むとき（smpHelperLoop から）。定跡・詰み探索・時間の使い方は主だけ
+    const H = smpRole === 'helper' && o._helper ? o._helper : null;
     const lv = o.level != null ? LEVELS.find((x) => x.level === Number(o.level)) || null : null;
     // 数でない timeMs / maxDepth は渡されなかったものとして扱う（NaN だと止まらなくなるため）
     const tmIn = o.timeMs == null || o.timeMs === '' ? NaN : Number(o.timeMs);
@@ -3355,13 +3592,14 @@ select {
 
     setTune(o.tune);
     ttAlloc(T_ttbits);
-    ttGen = (ttGen + 1) & 0x1fffff;
+    // 置換表の世代。手伝いは主の世代に合わせる（同じ表を分け合うため）
+    ttGen = H ? (H.gen | 0) & 0x1fffff : (ttGen + 1) & 0x1fffff;
     // 評価を決める：setEvaluator の差し替え ＞ 段階の設定（learnedEval）の学習した評価 ＞ 手書き。
-    // 評価が変わったら、置換表の値は別の評価のものなので消す
+    // 評価が変わったら、置換表の値は別の評価のものなので消す（手伝いは自分の手の並べ方の覚えだけ。共有の置換表は主が消す）
     const wantLearned = o.learnedEval != null ? !!o.learnedEval : !!(lv && lv.learnedEval);
     const ev = userEv || (wantLearned ? getLearned() : null);
-    if (ev !== activeEv) { useEv(ev); clearHash(); }
-    if (o.clearHash) clearHash();
+    if (ev !== activeEv) { useEv(ev); if (H) clearTables(); else clearHash(); }
+    if (o.clearHash) { if (H) clearTables(); else clearHash(); }
     for (let j = 0; j < history.length; j++) history[j] >>= 2;
     killers.fill(0);
 
@@ -3383,6 +3621,15 @@ select {
     gameLimitPly = 512;
     hardLimit = t0 + timeMs;
     nodeLimit = hasMn ? mnIn : Infinity;
+    // 並列の読み：主は本体からの「止めて」（この go の番号 abortId）を見る。手伝いは主の「止める合図」を見る（checkTime）
+    abortId = smpRole === 'main' && Number.isInteger(o.abortId) && o.abortId > 0 ? o.abortId : 0;
+    jobSeq = 0;
+    if (H) {
+      nodeLimit = Infinity;
+      Atomics.store(shCtl, slotOf(smpIndex) + F_NODES, 0);
+      smpPublish(H.seq, 0, 0, 0, 0);   // 欄を今の仕事にそろえる（深さ 0 ＝まだ結果なし）
+      jobSeq = H.seq;
+    }
 
     const result = (bm, score, depth, pv) => {
       const t = now() - t0;
@@ -3397,7 +3644,7 @@ select {
       r.mate = 0;
       return r;
     }
-    if (!inCheck) {
+    if (!inCheck && !H) {
       const mm = p.mateIn1();
       if (mm) {
         const r = result(moveToUsi(mm), MATE - 1, 1, [moveToUsi(mm)]);
@@ -3406,7 +3653,7 @@ select {
       }
     }
     // 定跡（つなぎ口 a）：使う設定で、定跡に手があれば読まずに指す
-    const useBook = o.book != null ? !!o.book : !!(lv && lv.book);
+    const useBook = !H && (o.book != null ? !!o.book : !!(lv && lv.book));
     if (useBook) {
       const pick = typeof o.bookPick === 'string' ? o.bookPick : lv && lv.bookPick ? lv.bookPick : 'count';
       const u = probeBook(p, o.startSfen || STARTPOS, mv, pick);
@@ -3417,7 +3664,7 @@ select {
       }
     }
     // 詰み探索（つなぎ口 b）：王手の連続で詰ませる手順が見つかれば、それを指す（王手されていても、王手を外しつつ王手する手を探す）
-    const useMate = o.mateSearch != null ? !!o.mateSearch : !!(lv && lv.mateSearch);
+    const useMate = !H && (o.mateSearch != null ? !!o.mateSearch : !!(lv && lv.mateSearch));
     let mateMs = 0;
     if (useMate) {
       const share = typeof o.mateShare === 'number' && o.mateShare > 0 ? o.mateShare : lv && lv.mateShare ? lv.mateShare : 0.1;
@@ -3447,13 +3694,32 @@ select {
     const softLimit = timeMs * 0.6;
     const depthCap = rootN === 1 ? Math.min(maxDepth, 4) : maxDepth;
 
+    // 並列の読み（主）：段階の設定 parallel（Lv4〜7）か、threads（2 以上）を渡されたとき、待っている手伝いに同じ局面を読んでもらう。
+    // 揺らぎのある段階・評価を差し替えているとき（setEvaluator。手伝いには渡らない）・合法手が1つのときは使わない
+    let smpSeq = 0, nThreads = 1;
+    if (!H && smpRole === 'main' && userEv === null && noiseAmp === 0 && !fullRoot && blunder === 0 && rootN > 1) {
+      const want = o.threads != null ? Math.floor(Number(o.threads)) : (lv && lv.parallel ? SMP_MAX : 1);
+      if (want > 1) {
+        const live = smpLiveHelpers().slice(0, Math.min(want, SMP_MAX) - 1);
+        if (live.length) {
+          smpSeq = smpWriteJob({ startSfen: o.startSfen || STARTPOS, moves: mv, level: lv ? lv.level : null, learned: wantLearned,
+            tune: o.tune || null, maxDepth, cap: Math.min(timeMs, 600000) + 3000, clear: !!o.clearHash, gen: ttGen, maxIdx: live[live.length - 1] });
+          if (smpSeq) nThreads = 1 + live.length;
+        }
+      }
+    }
+
     let bestMove = rootMoves[0], bestScore = 0, bestDepth = 0, bestPv = [moveToUsi(rootMoves[0])];
     let lastScores = null, lastMoves = null;
     // 時間の使い方（tm）：最善手が変わった回数（古いものほど軽く）と、評価の下がり方で、次の深さを始める上限を動かす
     let changes = 0, prevBest = 0, prevScore = 0, stableIters = 0;
+    let smpOut = null;
+    try {
     for (let d = 1; d <= depthCap; d++) {
+      // 手伝い：手伝いごとに決まった深さを飛ばす（深さ 1 は必ず読む）
+      if (H && d > 1 && T_smpskip && smpSkip(d, smpIndex)) continue;
       rootDepth = d;
-      canStop = d > 1;
+      canStop = H ? true : d > 1;
       let alpha = -INF, beta = INF, delta = 80;
       if (d >= 4 && !fullRoot && Math.abs(bestScore) < MATE_BOUND) { alpha = bestScore - delta; beta = bestScore + delta; }
       let sc;
@@ -3467,7 +3733,7 @@ select {
       }
       if (stopFlag) {
         // 途中までの深さで、前の最善手より良いと読み切れた手があればそれを指す
-        if (partialMove !== 0 && d > 1) {
+        if (partialMove !== 0 && d > 1 && !H) {
           bestMove = partialMove; bestScore = partialScore;
           bestPv = partialPv.map(moveToUsi);
           if (!bestPv.length || bestPv[0] !== moveToUsi(bestMove)) bestPv = [moveToUsi(bestMove)];
@@ -3475,6 +3741,13 @@ select {
         break;
       }
       bestMove = rootMoves[0]; bestScore = sc; bestDepth = d;
+      if (H) {
+        // 手伝い：読み切った深さの結果を欄に書く。時間の使い方は主だけ
+        smpPublish(H.seq, d, sc, bestMove, pvLen[0]);
+        const mh = mateOf(sc);
+        if (mh !== null && d >= Math.abs(mh) + 2) break;
+        continue;
+      }
       bestPv = [];
       for (let j = 0; j < pvLen[0]; j++) bestPv.push(moveToUsi(pvTab[j]));
       if (!bestPv.length || bestPv[0] !== moveToUsi(bestMove)) bestPv = [moveToUsi(bestMove)];
@@ -3482,7 +3755,8 @@ select {
       const el = now() - t0;
       const elN = hasMn ? nodes / mnIn : 0;
       if (o.onInfo) {
-        o.onInfo({ depth: d, score: bestScore, mate: mateOf(bestScore), nodes, nps: Math.round(nodes * 1000 / Math.max(1, el)), pv: bestPv.slice(), timeMs: Math.round(el) });
+        const tn = smpSeq ? nodes + smpHelperNodes(smpSeq) : nodes;   // 並列のときは全員の局面数
+        o.onInfo({ depth: d, score: bestScore, mate: mateOf(bestScore), nodes: tn, nps: Math.round(tn * 1000 / Math.max(1, el)), pv: bestPv.slice(), timeMs: Math.round(el) });
       }
       const mt = mateOf(bestScore);
       if (mt !== null && d >= Math.abs(mt) + 2) break;
@@ -3500,6 +3774,27 @@ select {
         if (frac > target) break;
       } else if (el > softLimit || elN > 0.6) break;
     }
+    } finally {
+      // 並列の読み（主）：手伝いを止め、結果を集める（例外のときも必ず止める）
+      if (smpSeq) smpOut = smpFinish(smpSeq);
+    }
+    if (H) return result(moveToUsi(bestMove), bestScore, bestDepth, []);
+
+    // 並列の読み（主）：いちばん深く読み切った結果を選ぶ。手伝いの手は、この局面の合法手の中にあるものだけ使う
+    if (smpOut) {
+      let cand = { depth: bestDepth, score: bestScore, main: true }, pick = null;
+      for (const h of smpOut.res) {
+        let ok = false;
+        for (let i = 0; i < rootN; i++) if (rootMoves[i] === h.move) { ok = true; break; }
+        if (!ok || !h.pv.length || h.pv[0] !== h.move) continue;
+        if (smpBetter(h, cand)) { cand = h; pick = h; }
+      }
+      if (pick) {
+        bestMove = pick.move; bestScore = pick.score; bestDepth = pick.depth;
+        bestPv = smpPvUsi(p, pick.pv);
+      }
+      nodes += smpOut.nodes;   // 結果の局面数は全員の合計
+    }
 
     // 弱い段階：ときどき次善手
     if (fullRoot && lastScores && blunder > 0 && rootN > 1 && Math.random() < blunder) {
@@ -3512,6 +3807,7 @@ select {
 
     const r = result(moveToUsi(bestMove), bestScore, bestDepth, bestPv);
     if (useMate) r.mateMs = Math.round(mateMs);
+    if (smpOut) r.threads = nThreads;
     if (lv && lv.resign && r.mate !== null && r.mate < 0) r.bestmove = 'resign';
     return r;
   }
@@ -3519,6 +3815,9 @@ select {
   return {
     LEVELS, search, evaluate: (p) => evaluate(p), clearHash, setEvaluator, setLearnedEval, setBook, setMate, TUNE_DEFAULT,
     usingLearnedEval: () => activeEv !== null && activeEv === learnedEv,
+    // 並列の読み（設計 §15）
+    SMP: { MAX: SMP_MAX, CTL_BYTES, create: smpCreate, attach: smpAttach, detach: smpDetach, helperLoop: smpHelperLoop,
+      abort: smpAbort, markDead: smpMarkDead, quit: smpQuit, states: smpStates, role: () => smpRole, index: () => smpIndex },
     _: { PST_TAB, HAND_TAB, MATE, MATE_BOUND, PERP, SEEV, see: seeTest, chooseBook },
   };
 });
@@ -42195,6 +42494,514 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
   };
 });
 </script>
+<script id="src-evalkp-wasm" type="text/plain">
+/* 学習した評価関数の重い計算のウェブアセンブリ版（→ ShogiEvalKPWasm。engine/evalkp.js が使う）
+ *
+ * ウェブアセンブリを作る道具（コンパイラ）を使わず、この中の「小さな生成器」がバイト列を JS で組み立てる。
+ * 重みの形（神経網の隠れの数 H など）に合わせて、その場で命令を書き出す（H が 8 の倍数のときだけ。ほかは null を返して JS で計算する）。
+ * 128 ビットの SIMD（i32x4・i16x8 の足し算など）を使う。ブラウザでは Chrome 91・Firefox 89・Safari 16.4（iOS 16.4）から使える。
+ * 使えない環境（古い Safari、ウェブアセンブリを止めたページなど）では create が null を返し、evalkp.js は今までの JS の計算に戻る。
+ *
+ * ■ ここでする計算（どれも evalkp.js の JS の計算と同じ値。tests/evalkp_wasm.test.js で確かめる）
+ *   diff(dst, src, na, ns)：神経網の 1 層目（H 個の 32 ビット整数）を、src の値に「足す行の一覧」「引く行の一覧」の重みを足し引きして dst に書く
+ *   refresh(slot, kb, nb, fb, hf, dst, nm)：玉のマスごとの覚え（盤・持ち駒・KP の合計・1 層目）と今の盤を 16 マスずつ比べ、
+ *       違うマス・持ち駒だけを足し引きする。KP の合計を返し、1 層目を dst に書く（覚えも今の盤に合わせる）。
+ *       違うマスが玉の周り 5×5（nm の印）に入っていたら FLAG に 0 でない値を書く（玉の周りの数を覚えから使えるかの判断に使う）
+ *   out(us, them)：手番側と相手側の 1 層目を 0〜qa で切り、出力の重みを掛けて足した整数（f64 で返す。JS で qa で割る）
+ *   scan(c, ks, dst)：c 側の玉（盤のマス ks）の周り 24 マスの [攻め, 守り, 空き, 駒の組の点] を dst に書く（evalkp.js の scanKing と同じ値。
+ *       借りた特徴か駒の組があるときだけ作る）
+ *   mob()：盤上の走り駒（SLQ に写した 4 つのマス）の動けるマスの数ごとの点の合計（先手から見た値。借りた特徴があるときだけ使う）
+ *   盤・持ち駒は JS が評価のたびにこの記憶（BOARD・HANDS）へ写す（盤 143 バイト。core の並びそのまま）。
+ *
+ * ■ 使い方（evalkp.js から）
+ *   const ws = ShogiEvalKPWasm.create({ H, NQA, NSQ, W1, B1, W2, KP, FB, HF, NM, nslot, maxh, emptyBoard,
+ *                                      needNB, PR, HMOB, SS, SL, MOBK, DEFW, ATTW, KIND })   // 使えなければ null（理由は lastError）
+ *   ws.fDiff / fRefresh / fOut / fScan / fMob：ウェブアセンブリの関数。ws.addList・subList・board・hands・flag・nbc・slq：記憶の窓（型付き配列）
+ *   ws.N0・N1：手数ごとの 1 層目（先手の玉・後手の玉）の置き場の始まり。ws.W1・KPOFF・FBOFF・HFOFF・NMOFF・NBCOFF：置き場の始まり（すべてバイト）
+ *   ws.reset()：玉のマスごとの覚えを「空の盤・持ち駒なし・KP 0・1 層目＝偏り」に戻す（そこから違いを足せば全部を数えたのと同じ）
+ *   ws.ms：作って重みを記憶に写した時間（ms）。ws.bytes：モジュールの大きさ。ws.memBytes：記憶の大きさ
+ *   モジュールは 4KB 未満にしておく（Chrome は本体のスレッドで 4KB を超えるモジュールをその場でコンパイルさせない。Worker の中は大きくてよい）
+ */
+(function (root, factory) {
+  const api = factory(root);
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  else root.ShogiEvalKPWasm = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (root) {
+  'use strict';
+
+  // ===== 小さな生成器 =====
+  const I32 = 0x7f, I64 = 0x7e, F64 = 0x7c, V128 = 0x7b;
+  function uleb(out, v) {
+    do { let b = v & 0x7f; v = Math.floor(v / 128); if (v !== 0) b |= 0x80; out.push(b); } while (v !== 0);
+    return out;
+  }
+  function sleb(out, v) {
+    v |= 0;
+    for (;;) {
+      const b = v & 0x7f;
+      v >>= 7;
+      if ((v === 0 && (b & 0x40) === 0) || (v === -1 && (b & 0x40) !== 0)) { out.push(b); return out; }
+      out.push(b | 0x80);
+    }
+  }
+  // 1 つの関数の命令を書きためる
+  class Code {
+    constructor(name, params, results) { this.name = name; this.params = params; this.results = results; this.locals = []; this.b = []; }
+    local(t) { this.locals.push(t); return this.params.length + this.locals.length - 1; }
+    op(...x) { for (const v of x) this.b.push(v); return this; }
+    u(v) { uleb(this.b, v); return this; }
+    get(i) { return this.op(0x20).u(i); }
+    set(i) { return this.op(0x21).u(i); }
+    tee(i) { return this.op(0x22).u(i); }
+    i32(c) { this.op(0x41); sleb(this.b, c); return this; }
+    // 流れ（block・loop・if は値を残さない形だけ使う）
+    block() { return this.op(0x02, 0x40); }
+    loop() { return this.op(0x03, 0x40); }
+    if_() { return this.op(0x04, 0x40); }
+    else_() { return this.op(0x05); }
+    end() { return this.op(0x0b); }
+    brIf(d) { return this.op(0x0d).u(d); }
+    br(d) { return this.op(0x0c).u(d); }
+    select() { return this.op(0x1b); }
+    // 整数の計算
+    add() { return this.op(0x6a); }
+    sub() { return this.op(0x6b); }
+    mul() { return this.op(0x6c); }
+    and() { return this.op(0x71); }
+    or() { return this.op(0x72); }
+    xor() { return this.op(0x73); }
+    shl() { return this.op(0x74); }
+    shrU() { return this.op(0x76); }
+    popcnt() { return this.op(0x69); }
+    eq() { return this.op(0x46); }
+    ltU() { return this.op(0x49); }
+    ctz() { return this.op(0x68); }
+    eqz() { return this.op(0x45); }
+    ltS() { return this.op(0x48); }
+    gtS() { return this.op(0x4a); }
+    geS() { return this.op(0x4e); }
+    i64add() { return this.op(0x7c); }
+    f64FromI64() { return this.op(0xb9); }
+    // 記憶の読み書き（align は 2 の何乗か。off は命令に入れる定数のずれ）
+    mem(o, align, off) { return this.op(o).u(align).u(off || 0); }
+    load8u(off) { return this.mem(0x2d, 0, off); }
+    load16s(off) { return this.mem(0x2e, 1, off); }
+    load16u(off) { return this.mem(0x2f, 1, off); }
+    load32(off) { return this.mem(0x28, 2, off); }
+    store32(off) { return this.mem(0x36, 2, off); }
+    // SIMD（0xFD の後に番号を LEB128 で書く）
+    simd(n) { return this.op(0xfd).u(n); }
+    vload(off) { return this.simd(0x00).u(4).u(off || 0); }          // v128.load
+    vload16x4s(off) { return this.simd(0x03).u(3).u(off || 0); }     // v128.load16x4_s（16 ビット 4 個を 32 ビットに広げて読む）
+    vstore(off) { return this.simd(0x0b).u(4).u(off || 0); }         // v128.store
+    i32x4splat() { return this.simd(0x11); }
+    i8x16splat() { return this.simd(0x0f); }
+    i8x16shuffle(lanes) { this.simd(0x0d); for (const v of lanes) this.b.push(v); return this; }   // 16 個の欄の番号（0〜15 が前、16〜31 が後ろ）
+    i8x16swizzle() { return this.simd(0x0e); }
+    i32x4lane(k) { return this.simd(0x1b).op(k); }                   // i32x4.extract_lane
+    i8x16eq() { return this.simd(0x23); }
+    vand() { return this.simd(0x4e); }
+    vandnot() { return this.simd(0x4f); }
+    i8x16shrU() { return this.simd(0x6d); }
+    i8x16add() { return this.simd(0x6e); }
+    i16x8extaddPairwiseI8x16u() { return this.simd(0x7d); }
+    i32x4extaddPairwiseI16x8u() { return this.simd(0x7f); }
+    i16x8extendLowI8x16u() { return this.simd(0x89); }
+    i16x8extendHighI8x16u() { return this.simd(0x8a); }
+    i16x8add() { return this.simd(0x8e); }
+    i64x2lane(k) { return this.simd(0x1d).op(k); }                   // i64x2.extract_lane
+    i8x16ne() { return this.simd(0x24); }
+    i8x16bitmask() { return this.simd(0x64); }
+    i16x8narrowI32x4s() { return this.simd(0x85); }
+    i32x4add() { return this.simd(0xae); }
+    i32x4sub() { return this.simd(0xb1); }
+    i32x4minS() { return this.simd(0xb6); }
+    i32x4maxS() { return this.simd(0xb8); }
+    i32x4dotI16x8s() { return this.simd(0xba); }
+    i64x2extLowI32x4s() { return this.simd(0xc7); }
+    i64x2extHighI32x4s() { return this.simd(0xc8); }
+    i64x2add() { return this.simd(0xce); }
+  }
+  // 関数の一覧と記憶の大きさ（64KB 単位）から、モジュールのバイト列を作る。記憶は "mem" の名前で外に出す
+  function assemble(fns, pages) {
+    const out = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    const section = (id, body) => { out.push(id); uleb(out, body.length); for (const v of body) out.push(v); };
+    const vec = (items) => { const b = uleb([], items.length); for (const it of items) for (const v of it) b.push(v); return b; };
+    const name = (s) => { const b = uleb([], s.length); for (let i = 0; i < s.length; i++) b.push(s.charCodeAt(i)); return b; };
+    section(1, vec(fns.map((f) => [0x60, ...vec(f.params.map((t) => [t])), ...vec(f.results.map((t) => [t]))])));
+    section(3, vec(fns.map((f, i) => uleb([], i))));
+    section(5, [1, 0x01, ...uleb([], pages), ...uleb([], pages)]);
+    section(7, vec([...fns.map((f, i) => [...name(f.name), 0x00, ...uleb([], i)]), [...name('mem'), 0x02, 0x00]]));
+    section(10, vec(fns.map((f) => {
+      const groups = [];
+      for (const t of f.locals) {
+        if (groups.length && groups[groups.length - 1][1] === t) groups[groups.length - 1][0]++;
+        else groups.push([1, t]);
+      }
+      const body = vec(groups.map(([n, t]) => [...uleb([], n), t]));
+      for (const v of f.b) body.push(v);
+      body.push(0x0b);
+      return [...uleb([], body.length), ...body];
+    })));
+    return new Uint8Array(out);
+  }
+
+  // ===== 記憶の置き場（バイト。どれも 16 の倍数から）=====
+  const align16 = (x) => (x + 15) & ~15;
+  function layout(p) {
+    const H = p.H, L = {};
+    let o = 64;
+    const put = (key, bytes) => { L[key] = o; o = align16(o + bytes); };
+    put('BOARD', 144);                 // 今の盤（core の 143 マスの並びそのまま。JS が写す）
+    put('HANDS', 16);                  // 今の持ち駒
+    put('ADD', 256 * 4);               // 足す行の一覧（重みの行のバイトの位置）
+    put('SUB', 256 * 4);               // 引く行の一覧
+    put('HF', 2 * 16 * 4);             // 側 c・持ち駒の欄（色×8＋駒）ごとの、持ち駒の 1 枚目の特徴の番号
+    put('FLAG', 16);                   // refresh が書く印（玉の周り 5×5 に覚えと違うマスがあったら 0 でない）
+    put('NM', p.NSQ * 8 * 4);          // 玉のマスごとの、周り 5×5 のマスの印（盤のバイト 16〜127 を 16 個ずつ 7 欄）
+    put('W2', 2 * H * 2);              // 出力の重み（手番側 H 個・相手側 H 個。16 ビット）
+    put('FB', p.FB.length * 2);        // 盤上の駒の特徴の番号（evalkp.js の FB と同じ）
+    put('KP', p.KP.length * 2);        // KP の重み
+    put('SKP', p.nslot * 4);           // 玉のマスごとの覚え：KP の合計
+    put('SB', p.nslot * 144);          // 　　　〃　　　　：盤
+    put('SH', p.nslot * 16);           // 　　　〃　　　　：持ち駒
+    put('SACC', p.nslot * H * 4);      // 　　　〃　　　　：神経網の 1 層目
+    put('N0', p.maxh * H * 4);         // 手数ごとの 1 層目（先手の玉）
+    put('N1', p.maxh * H * 4);         // 手数ごとの 1 層目（後手の玉）
+    // 玉の周りの数（scan）と、走り駒の動けるマスの数（mob）に使う表
+    put('NBC', p.maxh * 8 * 4);        // 手数ごとの玉の周りの数 [攻め, 守り, 空き, 駒の組の点] × 2（evalkp.js の NBC そのもの）
+    put('VC', 16 * 10);                // 定数の 16 バイトの並び（守りの重み・攻めの重み・駒の状態・相手の駒に足す数・隣の印 2 つ・前の 8 欄の印・z×19 を 3 つ）
+    put('XS', 24 * 2);                 // scan の作業場：24 マスの項目の番号（16 ビット）
+    put('LIST', 24 * 4);               // scan の作業場：見つけた項目の番号×2
+    put('PR', p.PR ? p.PR.length * 2 : 0);   // 駒の組の点
+    put('SS', 33 * 4);                 // 駒の番号ごとの走る方向の一覧の始まり（core の SLIDE_START）
+    put('SL', 64 * 4);                 // 走る方向（core の SLIDE_LIST）
+    put('MOBK', 16 * 4);               // 角・飛・馬・龍 → 0〜3
+    put('HMOB', 4 * 21 * 4);           // 動けるマスの数ごとの点
+    put('SLQ', 16);                    // 盤上の走り駒のマス（4 つ。JS が pos.slSq を写す）
+    put('W1', p.W1.length * 2);        // 神経網の 1 層目の重み（いちばん大きい）
+    L.size = o;
+    return L;
+  }
+
+  // ===== 計算の命令を書き出す =====
+  function generate(p, L) {
+    const H = p.H, V = H >> 2, NSQ = p.NSQ;
+
+    // --- diff(dst, src, na, ns) ---
+    const d = new Code('diff', [I32, I32, I32, I32], []);
+    {
+      const DST = 0, SRC = 1, NA = 2, NS = 3;
+      const ptr = d.local(I32), e = d.local(I32), acc = [];
+      for (let v = 0; v < V; v++) acc.push(d.local(V128));
+      for (let v = 0; v < V; v++) d.get(SRC).vload(16 * v).set(acc[v]);
+      for (const [list, n, isAdd] of [[L.ADD, NA, true], [L.SUB, NS, false]]) {
+        d.i32(list).set(ptr);
+        d.block().get(n).eqz().brIf(0).loop();
+        d.get(ptr).load32(0).set(e);
+        for (let v = 0; v < V; v++) { d.get(acc[v]).get(e).vload16x4s(8 * v); if (isAdd) d.i32x4add(); else d.i32x4sub(); d.set(acc[v]); }
+        d.get(ptr).i32(4).add().set(ptr);
+        d.get(n).i32(1).sub().tee(n).brIf(0);
+        d.end().end();
+      }
+      for (let v = 0; v < V; v++) d.get(DST).get(acc[v]).vstore(16 * v);
+    }
+
+    // --- refresh(slot, kb, nb, fb, hf, dst, nm) → KP の合計。玉の周り 5×5 に違うマスがあったかを FLAG に書く ---
+    const r = new Code('refresh', [I32, I32, I32, I32, I32, I32, I32], [I32]);
+    {
+      const SLOT = 0, KB = 1, NB = 2, FBB = 3, HFB = 4, DST = 5, NMB = 6;
+      const near = r.local(I32), w = r.local(I32), sb = r.local(I32), sa = r.local(I32), a = r.local(I32), m = r.local(I32), sq = r.local(I32), pc = r.local(I32);
+      const f = r.local(I32), row = r.local(I32), so = r.local(I32), n = r.local(I32), n0 = r.local(I32), f0 = r.local(I32), idx = r.local(I32);
+      const acc = [];
+      for (let v = 0; v < V; v++) acc.push(r.local(V128));
+      // 特徴 f（局所変数）を足す・引く：KP の合計 a と 1 層目の H 個
+      const feature = (isAdd) => {
+        r.get(a).get(KB).get(f).i32(1).shl().add().load16s(0);
+        if (isAdd) r.add(); else r.sub();
+        r.set(a);
+        r.get(NB).get(f).i32(H * 2).mul().add().set(row);
+        for (let v = 0; v < V; v++) { r.get(acc[v]).get(row).vload16x4s(8 * v); if (isAdd) r.i32x4add(); else r.i32x4sub(); r.set(acc[v]); }
+      };
+      // マス sq の駒 pc（0 なら何もしない）の特徴を足す・引く（自分の玉のように特徴の番号が負なら何もしない）
+      const piece = (isAdd) => {
+        r.get(pc).if_();
+        r.get(FBB).get(pc).i32(NSQ).mul().get(sq).add().i32(1).shl().add().load16s(0).tee(f);
+        r.i32(0).geS().if_();
+        feature(isAdd);
+        r.end().end();
+      };
+      r.get(SLOT).i32(144).mul().i32(L.SB).add().set(sb);
+      r.get(SLOT).i32(H * 4).mul().i32(L.SACC).add().set(sa);
+      r.get(SLOT).i32(4).mul().load32(L.SKP).set(a);
+      for (let v = 0; v < V; v++) r.get(sa).vload(16 * v).set(acc[v]);
+      // 盤：バイト 16〜127（盤のマス 23〜119 を含む）を 16 マスずつ、7 回くり返して比べる（w はその区切りの始まり）
+      r.i32(16).set(w);
+      r.loop();
+      r.get(w).vload(L.BOARD).get(sb).get(w).add().vload(0).i8x16ne().i8x16bitmask().tee(m);
+      r.if_();
+      r.get(near).get(m).get(NMB).get(w).i32(16).sub().i32(2).shrU().add().load32(0).and().or().set(near);
+      r.loop();
+      r.get(m).ctz().get(w).add().set(sq);
+      r.get(sb).get(sq).add().load8u(0).set(pc);
+      piece(false);
+      r.get(sq).load8u(L.BOARD).set(pc);
+      piece(true);
+      r.get(m).get(m).i32(1).sub().and().tee(m).brIf(0);
+      r.end();
+      r.get(sb).get(w).add().get(w).vload(L.BOARD).vstore(0);
+      r.end();
+      r.get(w).i32(16).add().tee(w).i32(128).ltS().brIf(0);
+      r.end();
+      // 持ち駒：16 欄を比べる
+      r.get(SLOT).i32(16).mul().set(so);
+      r.i32(0).vload(L.HANDS).get(so).vload(L.SH).i8x16ne().i8x16bitmask().tee(m);
+      r.if_().loop();
+      r.get(m).ctz().set(idx);
+      r.get(idx).load8u(L.HANDS).set(n);
+      r.get(so).get(idx).add().load8u(L.SH).set(n0);
+      r.get(HFB).get(idx).i32(2).shl().add().load32(0).set(f0);
+      r.get(n).get(n0).gtS().if_();
+      r.loop().get(f0).get(n0).add().set(f); feature(true); r.get(n0).i32(1).add().tee(n0).get(n).ltS().brIf(0).end();
+      r.else_();
+      r.loop().get(f0).get(n).add().set(f); feature(false); r.get(n).i32(1).add().tee(n).get(n0).ltS().brIf(0).end();
+      r.end();
+      r.get(m).get(m).i32(1).sub().and().tee(m).brIf(0);
+      r.end();
+      r.get(so).i32(0).vload(L.HANDS).vstore(L.SH);
+      r.end();
+      for (let v = 0; v < V; v++) { r.get(sa).get(acc[v]).vstore(16 * v); r.get(DST).get(acc[v]).vstore(16 * v); }
+      r.get(SLOT).i32(4).mul().get(a).store32(L.SKP);
+      r.i32(0).get(near).store32(L.FLAG);
+      r.get(a);
+    }
+
+    // --- out(us, them) → 出力の重みを掛けて足した整数（f64）---
+    const o = new Code('out', [I32, I32], [F64]);
+    {
+      const US = 0, TH = 1;
+      const qa = o.local(V128), zero = o.local(V128), s32 = o.local(V128), s64 = o.local(V128);
+      o.i32(p.NQA).i32x4splat().set(qa);
+      o.i32(0).i32x4splat().tee(zero).tee(s32).set(s64);
+      let cnt = 0;
+      const flush = () => {
+        o.get(s64).get(s32).i64x2extLowI32x4s().i64x2add().get(s32).i64x2extHighI32x4s().i64x2add().set(s64);
+        o.get(zero).set(s32);
+        cnt = 0;
+      };
+      for (const [ptr, wb] of [[US, L.W2], [TH, L.W2 + H * 2]]) {
+        for (let g = 0; g < (H >> 3); g++) {
+          o.get(ptr).vload(32 * g).get(qa).i32x4minS().get(zero).i32x4maxS();
+          o.get(ptr).vload(32 * g + 16).get(qa).i32x4minS().get(zero).i32x4maxS();
+          o.i16x8narrowI32x4s();
+          o.i32(0).vload(wb + 16 * g);
+          o.i32x4dotI16x8s().get(s32).i32x4add().set(s32);
+          // 32 ビットの 1 つの欄に足すのは 8 回まで（4096 × 32768 × 2 × 8 ＝ 2^31 に収まる）。それを超える前に 64 ビットへ移す
+          if (++cnt === 8) flush();
+        }
+      }
+      if (cnt > 0) flush();
+      o.get(s64).i64x2lane(0).get(s64).i64x2lane(1).i64add().f64FromI64();
+    }
+    const fns = [d, r, o];
+    if (p.needNB) fns.push(genScan(p, L), genMob(p, L));
+    return fns;
+  }
+
+  // --- scan(c, ks, dst)：c 側の玉（盤のマス ks）の周り 24 マスを見て、[攻め, 守り, 空き, 駒の組の点] を dst に書く ---
+  // （evalkp.js の scanKing と同じ値。24 マスを 16 マスと 8 マスの 2 つの並びに集めて、攻め・守り・空きを一度に数える。
+  //   駒の組の点は、見つけた駒の項目どうしの組ごとに表を引いて足す）
+  // z の順（scanKing と同じ）：先手の玉は 5×5 を上の段から左から（玉のマスを除く）、後手の玉はその逆の順
+  function genScan(p, L) {
+    const sc = new Code('scan', [I32, I32, I32], []);
+    const C_ = 0, KS = 1, DST = 2;
+    const rw = [];
+    for (let k = 0; k < 5; k++) rw.push(sc.local(V128));
+    const A = sc.local(V128), B = sc.local(V128), occ = sc.local(V128), t = sc.local(V128), mine = sc.local(V128), opp = sc.local(V128);
+    const dsum = sc.local(V128), asum = sc.local(V128), st = sc.local(V128), tmp = sc.local(V128);
+    const holes = sc.local(I32), m = sc.local(I32), z = sc.local(I32), x = sc.local(I32), ptr = sc.local(I32), j = sc.local(I32), n = sc.local(I32), s = sc.local(I32);
+    const VC = L.VC, DEFW = VC, ATTW = VC + 16, STATE = VC + 32, OPPADD = VC + 48, ADJA = VC + 64, ADJB = VC + 80, LOW8 = VC + 96, Z19 = VC + 112;
+    // 5 段を読む（それぞれ玉の 2 つ左の筋から 16 バイト。盤の配列の外は 0 ＝空き）
+    const offs = [-24, -13, -2, 9, 20];
+    for (let k = 0; k < 5; k++) sc.get(KS).vload(L.BOARD + offs[k]).set(rw[k]);
+    const iota = (n0, n1) => { const a = []; for (let i = n0; i < n1; i++) a.push(i); return a; };
+    const pad = (a) => { while (a.length < 16) a.push(0); return a; };
+    sc.get(C_).if_();
+    // 後手の玉：逆の順
+    sc.get(rw[4]).get(rw[3]).i8x16shuffle(pad([4, 3, 2, 1, 0, 20, 19, 18, 17, 16]));
+    sc.get(rw[2]).i8x16shuffle(pad([...iota(0, 10), 20, 19, 17, 16]));
+    sc.get(rw[1]).i8x16shuffle([...iota(0, 14), 20, 19]).set(A);
+    sc.get(rw[1]).get(rw[0]).i8x16shuffle(pad([2, 1, 0, 20, 19, 18, 17, 16])).set(B);
+    sc.else_();
+    sc.get(rw[0]).get(rw[1]).i8x16shuffle(pad([0, 1, 2, 3, 4, 16, 17, 18, 19, 20]));
+    sc.get(rw[2]).i8x16shuffle(pad([...iota(0, 10), 16, 17, 19, 20]));
+    sc.get(rw[3]).i8x16shuffle([...iota(0, 14), 16, 17]).set(A);
+    sc.get(rw[3]).get(rw[4]).i8x16shuffle(pad([2, 3, 4, 16, 17, 18, 19, 20])).set(B);
+    sc.end();
+    sc.i32(0).i8x16splat().tee(dsum).set(asum);
+    sc.i32(0).set(holes);
+    for (const [V, adj, zoff, isB] of [[A, ADJA, 0, false], [B, ADJB, 16, true]]) {
+      // 駒がある欄（空きでも壁でもない）
+      sc.get(V).i32(0).i8x16splat().i8x16ne().get(V).i32(64).i8x16splat().i8x16ne().vand();
+      if (isB) sc.i32(0).vload(LOW8).vand();
+      sc.set(occ);
+      // 空き（隣のマスだけ数える）
+      sc.get(V).i32(0).i8x16splat().i8x16eq().i32(0).vload(adj).vand().i8x16bitmask().popcnt().get(holes).add().set(holes);
+      sc.get(V).i32(15).i8x16splat().vand().set(t);
+      sc.get(V).i32(4).i8x16shrU().get(C_).i8x16splat().i8x16eq().get(occ).vand().set(mine);
+      sc.get(occ).get(mine).vandnot().set(opp);
+      // 守り・攻めの重み（隣のマスは 2 倍）
+      for (const [W, msk, sum] of [[DEFW, mine, dsum], [ATTW, opp, asum]]) {
+        sc.i32(0).vload(W).get(t).i8x16swizzle().get(msk).vand().tee(tmp).get(tmp).i32(0).vload(adj).vand().i8x16add();
+        sc.get(sum).i8x16add().set(sum);
+      }
+      if (p.PR) {
+        // 項目の番号 ＝ z × 19 ＋ 駒の状態（自分の駒 0〜8・相手の駒 9〜17・相手の玉 18）
+        sc.i32(0).vload(STATE).get(t).i8x16swizzle().i32(0).vload(OPPADD).get(t).i8x16swizzle().get(opp).vand().i8x16add().set(st);
+        sc.i32(0).get(st).i16x8extendLowI8x16u().i32(0).vload(Z19 + zoff * 2).i16x8add().vstore(L.XS + zoff * 2);
+        if (!isB) sc.i32(0).get(st).i16x8extendHighI8x16u().i32(0).vload(Z19 + zoff * 2 + 16).i16x8add().vstore(L.XS + zoff * 2 + 16);
+        sc.get(occ).i8x16bitmask();
+        if (isB) sc.i32(16).shl().get(m).or();
+        sc.set(m);
+      }
+    }
+    // 攻め・守りの合計
+    for (const [sum, off] of [[asum, 0], [dsum, 4]]) {
+      sc.get(sum).i16x8extaddPairwiseI8x16u().i32x4extaddPairwiseI16x8u().set(tmp);
+      sc.get(DST).get(tmp).i32x4lane(0).get(tmp).i32x4lane(1).add().get(tmp).i32x4lane(2).add().get(tmp).i32x4lane(3).add().store32(off);
+    }
+    sc.get(DST).get(holes).store32(8);
+    sc.i32(0).set(s);
+    if (p.PR) {
+      // 駒の組の点：z の小さい順に項目を取り出し、それより前の項目との組の点を足す（表の番号 ＝ x(x−1)/2 ＋ 前の項目）
+      sc.i32(0).set(n);
+      sc.block().get(m).eqz().brIf(0).loop();
+      sc.get(m).ctz().i32(1).shl().load16u(L.XS).set(x);
+      sc.get(x).get(x).i32(1).sub().mul().set(ptr);
+      sc.i32(0).set(j);
+      sc.block().get(n).eqz().brIf(0).loop();
+      sc.get(s).get(ptr).get(j).load32(L.LIST).add().load16s(L.PR).add().set(s);
+      sc.get(j).i32(4).add().tee(j).get(n).ltU().brIf(0);
+      sc.end().end();
+      sc.get(n).get(x).i32(1).shl().store32(L.LIST);
+      sc.get(n).i32(4).add().set(n);
+      sc.get(m).get(m).i32(1).sub().and().tee(m).brIf(0);
+      sc.end().end();
+    }
+    sc.get(DST).get(s).store32(12);
+    return sc;
+  }
+
+  // --- mob() → 盤上の走り駒（SLQ の 4 つのマス）の動けるマスの数ごとの点の合計（先手から見た値。evalkp.js の hyBlack の前半と同じ値）---
+  function genMob(p, L) {
+    const f = new Code('mob', [], [I32]);
+    const i = f.local(I32), sq = f.local(I32), pc = f.local(I32), col = f.local(I32), cnt = f.local(I32), j = f.local(I32), e = f.local(I32);
+    const off = f.local(I32), x = f.local(I32), s = f.local(I32), v = f.local(I32);
+    f.i32(0).set(s).i32(0).set(i);
+    f.loop();
+    f.get(i).load32(L.SLQ).tee(sq).if_();
+    f.get(sq).load8u(L.BOARD).tee(pc).i32(4).shrU().set(col);
+    f.i32(0).set(cnt);
+    f.get(pc).i32(2).shl().tee(j).load32(L.SS + 4).set(e);
+    f.get(j).load32(L.SS).set(j);
+    f.block().loop();
+    f.get(j).get(e).geS().brIf(1);                                                // 方向を全部見た
+    f.get(j).i32(2).shl().load32(L.SL).set(off);
+    f.get(sq).get(off).add().set(x);
+    f.block().loop();
+    f.get(x).load8u(L.BOARD).brIf(1);
+    f.get(cnt).i32(1).add().set(cnt).get(x).get(off).add().set(x).br(0);
+    f.end().end();
+    f.get(x).load8u(L.BOARD).i32(4).shrU().get(col).xor().i32(1).eq().get(cnt).add().set(cnt);   // 相手の駒なら取れるマスとして数える
+    f.get(j).i32(1).add().set(j).br(0);
+    f.end().end();
+    // 20 で頭打ち
+    f.i32(20).get(cnt).get(cnt).i32(20).gtS().select().set(cnt);                 // select は条件が 0 でなければ前の値
+    f.get(pc).i32(15).and().i32(2).shl().load32(L.MOBK).i32(21).mul().get(cnt).add().i32(2).shl().load32(L.HMOB).set(v);
+    f.get(s).get(v).sub().get(s).get(v).add().get(col).select().set(s);         // 後手の駒なら引く、先手の駒なら足す
+    f.end();
+    f.get(i).i32(4).add().tee(i).i32(16).ltS().brIf(0);
+    f.end();
+    f.get(s);
+    return f;
+  }
+
+  // ===== 作る（使えなければ null と理由）=====
+  let lastError = null;
+  function create(p) {
+    lastError = null;
+    try {
+      if (typeof WebAssembly !== 'object' || typeof WebAssembly.Module !== 'function') { lastError = 'ウェブアセンブリがない'; return null; }
+      const H = p.H | 0;
+      if (H <= 0 || H % 8 !== 0 || H > 256) { lastError = '神経網の隠れの数が 8 の倍数でない'; return null; }
+      if (!(p.NQA > 0 && p.NQA <= 32767)) { lastError = '切る上限が 16 ビットに収まらない'; return null; }
+      const t0 = Date.now();
+      const L = layout(p);
+      const pages = Math.ceil(L.size / 65536);
+      const bytes = assemble(generate(p, L), pages);
+      if (typeof WebAssembly.validate === 'function' && !WebAssembly.validate(bytes)) { lastError = 'SIMD が使えない'; return null; }
+      const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {});
+      const ex = inst.exports, buf = ex.mem.buffer;
+      // 重みを記憶に写す
+      new Int16Array(buf, L.W1, p.W1.length).set(p.W1);
+      new Int16Array(buf, L.KP, p.KP.length).set(p.KP);
+      new Int16Array(buf, L.FB, p.FB.length).set(p.FB);
+      const w2 = new Int16Array(buf, L.W2, 2 * H);
+      for (let i = 0; i < 2 * H; i++) w2[i] = p.W2[i];
+      new Int32Array(buf, L.HF, 32).set(p.HF);
+      new Int32Array(buf, L.NM, p.NSQ * 8).set(p.NM);
+      if (p.needNB) {
+        const vc = new Uint8Array(buf, L.VC, 16 * 10);
+        for (let t = 0; t < 16; t++) {
+          vc[t] = p.DEFW[t]; vc[16 + t] = p.ATTW[t];
+          vc[32 + t] = t === 8 ? 18 : (p.KIND[t] < 0 ? 0 : p.KIND[t]);           // 駒の状態（自分の駒から見た種類。玉は 18）
+          vc[48 + t] = t === 8 ? 0 : 9;                                           // 相手の駒なら 9 を足す（相手の玉はそのまま 18）
+        }
+        // 隣のマス（周り 3×3）の z：6・7・8・11・12・15・16・17（後手の玉の逆の順でも同じ）
+        for (const zz of [6, 7, 8, 11, 12, 15, 16, 17]) vc[zz < 16 ? 64 + zz : 80 + zz - 16] = 255;
+        for (let k = 0; k < 8; k++) vc[96 + k] = 255;
+        const z19 = new Int16Array(buf, L.VC + 112, 24);
+        for (let zz = 0; zz < 24; zz++) z19[zz] = zz * 19;
+        if (p.PR) new Int16Array(buf, L.PR, p.PR.length).set(p.PR);
+        new Int32Array(buf, L.SS, 33).set(p.SS);
+        new Int32Array(buf, L.SL, p.SL.length).set(p.SL);
+        new Int32Array(buf, L.MOBK, 16).set(p.MOBK);
+        if (p.HMOB) new Int32Array(buf, L.HMOB, 84).set(p.HMOB);
+      }
+      const ms = Date.now() - t0;
+      const sb = new Uint8Array(buf, L.SB, p.nslot * 144), sh = new Uint8Array(buf, L.SH, p.nslot * 16);
+      const skp = new Int32Array(buf, L.SKP, p.nslot), sacc = new Int32Array(buf, L.SACC, p.nslot * H);
+      const ws = {
+        fDiff: ex.diff, fRefresh: ex.refresh, fOut: ex.out,
+        addList: new Int32Array(buf, L.ADD, 256), subList: new Int32Array(buf, L.SUB, 256),
+        board: new Uint8Array(buf, L.BOARD, 144), hands: new Uint8Array(buf, L.HANDS, 16),
+        N0: L.N0, N1: L.N1, W1: L.W1, KPOFF: L.KP, FBOFF: L.FB, HFOFF: L.HF, NMOFF: L.NM, flag: new Int32Array(buf, L.FLAG, 1),
+        fScan: ex.scan || null, fMob: ex.mob || null, NBCOFF: L.NBC,
+        nbc: new Int32Array(buf, L.NBC, p.maxh * 8), slq: new Int32Array(buf, L.SLQ, 4),
+        n0: new Int32Array(buf, L.N0, p.maxh * H), n1: new Int32Array(buf, L.N1, p.maxh * H),
+        bytes: bytes.length, memBytes: pages * 65536, ms,
+        reset() {
+          for (let s = 0; s < p.nslot; s++) sb.set(p.emptyBoard, s * 144);
+          sh.fill(0); skp.fill(0);
+          for (let s = 0; s < p.nslot; s++) sacc.set(p.B1, s * H);
+        },
+      };
+      ws.reset();
+      return ws;
+    } catch (e) {
+      lastError = String((e && e.message) || e);
+      return null;
+    }
+  }
+
+  return {
+    create,
+    get lastError() { return lastError; },
+    // 確かめ用：生成したバイト列だけを返す（tools/ で中身を見るときに使う）
+    _: { assemble, generate, layout, Code, uleb, sleb },
+  };
+});
+</script>
 <script id="src-evalkp" type="text/plain">
 /* 学習した評価関数（駒の位置＋玉と駒の関係＝KP＋小さな神経網）→ ShogiEvalKP
  *
@@ -42211,9 +43018,10 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
  *     KP の駒の種類は 9 つ（歩 香 桂 銀 金 角 飛 馬 龍。と・成香・成桂・成銀は金と同じ扱い）。
  *   借りた特徴（重みに hy があるときだけ）：手書きの評価（v1）の 2 つの式を材料にして、点の付け方を学習したもの
  *   - 角・飛・馬・龍が動けるマスの数ごとの点、玉の危なさの元の数 d を折れ線で点に直したもの（手番側の玉と相手の玉で別の線）
- *   - 毎回数える（差分ではない）。先手から見た値として線形の部分に足す
+ *   - 動けるマスの数は毎回数える。玉の危なさの材料（周り 24 マスの攻め・守り・空き）は、周りに触れたときだけ数え直す（差分更新の節）。
+ *     先手から見た値として線形の部分に足す
  *   玉の近くの駒の組（v3。重みに pr があるときだけ）：それぞれの玉の周り 5×5 の駒どうしの組ごとの点（囲いの形など）。
- *   - 毎回数える（差分ではない。周りの 24 マスだけ）。先手から見た値として線形の部分に足す
+ *   - 周りの 24 マスに触れたときだけ数え直す（玉の危なさの材料と一緒に）。先手から見た値として線形の部分に足す
  *   神経網の部分（重みに nn があるときだけ。NNUE と同じ考え方の小さなもの）：
  *   - それぞれの玉について、玉の位置の区分（25）× 同じ特徴 → H 個の数を足し合わせる（1 層目。差分で足し引きできる）
  *   - 0〜1 で切って（clipped ReLU）、手番側の H 個と相手側の H 個に重みを掛けて足す → 手番側から見た点
@@ -42221,16 +43029,22 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
  *   全体＝ 線形の部分（手番側から見た値に直す）＋ 神経網の部分
  *
  * ■ 差分更新
- *   A先手・A後手（と神経網の H 個）は、手数（pos.ply）ごとに「その局面のハッシュ」と一緒に覚えておく。
+ *   A先手・A後手（と神経網の H 個、玉の周りの数）は、手数（pos.ply）ごとに「その局面のハッシュ」と一緒に覚えておく。
  *   評価を頼まれたら、少し前の手数で覚えた値のハッシュが今の手順の局面（pos.hLo/hHi）と一致すれば、
- *   そこから指した手（pos.moveStack）だけを足し引きする。玉が動いた側の線形の部分は全部を数え直す
- *   （神経網の部分は、玉の区分が変わったときだけ数え直す）。
- *   神経網の数え直し（玉の区分が変わった・近い手数に覚えが無い）は、v3 から「玉の区分ごとの覚え」を使う：
- *   側・区分ごとに最後に数えた 1 層目の値と、そのときの盤・持ち駒を覚えておき、今の盤との違いだけを足し引きする。
- *   一致するものがなければ全部を数える（結果は必ず全部を数えたときと同じ。tests/evalkp.test.js で確かめる）。
+ *   そこから指した手（pos.moveStack）だけを足し引きする。
+ *   玉が動いた側と、近い手数に覚えが無いときは「玉のマスごとの覚え」から数え直す（2026-10-18。v3 は KP を全部数え直していた）：
+ *   側・玉のマスごとに最後に数えた KP の合計・神経網の 1 層目と、そのときの盤・持ち駒を覚えておき、今の盤との違いだけを足し引きする。
+ *   玉の周り 5×5 の数（玉の危なさの材料・駒の組の点）は、指した手（または覚えの盤との違い）が周りに触れたときだけ数え直す。
+ *   結果は必ず全部を数えたときと同じ（tests/evalkp.test.js・tests/evalkp_wasm.test.js で確かめる）。
+ *
+ * ■ ウェブアセンブリ（2026-10-18。engine/evalkp_wasm.js）
+ *   使えるとき（SIMD のあるブラウザ・Node）は、神経網の差分・玉のマスごとの覚えからの数え直し・出力・玉の周りの数・走り駒の数を
+ *   ウェブアセンブリで計算する。読み込みのときに決まった手順で JS の全部を数えた値と比べ、違えば JS に戻す。
+ *   evalkp_wasm.js が読み込まれていない・ウェブアセンブリや SIMD が使えない・隠れの数が 8 の倍数でない、のどれでも JS で計算する。
+ *   使っているかは init の返す info.wasm（使わない理由は info.wasmNote）。
  *
  * ■ 使い方
- *   ShogiEvalKP.init()                 // 重みを読む（Node は ./weights_kp.js、ページは root.ShogiEvalKPWeights）
+ *   ShogiEvalKP.init()                 // 重みを読む（Node は ./weights_kp.js、ページは root.ShogiEvalKPWeights）。info を返す
  *   ShogiSearch.setEvaluator(ShogiEvalKP.evaluator())   // { evaluate, tables } を探索に渡す
  *   ShogiEvalKP.evaluate(pos)          // 手番側から見た評価値（歩1枚≒100）。差分更新つき
  *   ShogiEvalKP.evaluateFull(pos)      // 同じ値を毎回全部数えて出す（確かめ用）
@@ -42386,6 +43200,7 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
   let HKS = null, HKO = null;              // 玉の危なさの 2 本の曲線（hy.kds・hy.kdo があるとき。HKD の代わりに使う）
   let PR = null;                           // 玉の近くの駒の組の点（v3。Int16Array(NPR)。無ければ null）
   let info = null;
+  let WS = null;                           // ウェブアセンブリの計算（engine/evalkp_wasm.js。使えないときは null で JS だけ）
 
   // base64 → バイト列（ブラウザ・Worker・Node のどれでも動く素の実装）
   const B64 = new Int16Array(128).fill(-1);
@@ -42432,7 +43247,11 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
   // 重みを読む。w を省くと Node は ./weights_kp.js、ページは root.ShogiEvalKPWeights を使う。
   // 配列で直接渡すこともできる（学習の道具・テスト用）：
   //   { kp: Int16Array, ps: Int16Array, ph: Int16Array, tempo, nn?: { h, qa, w1, b1, w2, b2 } }
-  function init(w) {
+  // opts.wasm が false なら、ウェブアセンブリを使わず JS だけで計算する（比べる・確かめる用）。
+  // opts.wasmNear が false なら、玉の周りの数と走り駒の数だけ JS で計算する（速さの内訳を測る用）。
+  // 全体の決まり（globalThis／Worker の self）に ShogiEvalKPNoWasm = true があっても JS だけにする（実機で速さを比べる用）。
+  // 返す info：{ ms, meta, hidden, pairs, wasm（ウェブアセンブリを使っているか）, wasmMs（その用意と確かめの時間）, wasmCopyMs（重みを写した時間）, wasmNote（使わない理由） }
+  function init(w, opts) {
     const t0 = Date.now();
     let src = w;
     if (src == null) {
@@ -42474,9 +43293,15 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
       PR = dec(src.pr.w, NPR);
     }
     if (tmpNN.length < 2 * NH) tmpNN = new Int32Array(2 * NH);
+    NEEDNB = HMOB !== null || PR !== null;
     buildTables();
+    useWs(null);
     allocCache();
-    info = { ms: Date.now() - t0, meta: src.meta || null, hidden: NH, pairs: PR !== null };
+    info = { ms: Date.now() - t0, meta: src.meta || null, hidden: NH, pairs: PR !== null, wasm: false, wasmMs: 0, wasmNote: null };
+    wasmNearOff = !!(opts && opts.wasmNear === false);
+    if (opts && opts.wasm === false) info.wasmNote = '使わない設定';
+    else if (root && root.ShogiEvalKPNoWasm === true) info.wasmNote = '使わない設定（ShogiEvalKPNoWasm）';
+    else setupWasm();
     return info;
   }
   function ready() { return KP !== null; }
@@ -42615,63 +43440,200 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
   }
 
   // ===== 差分更新つきの評価 =====
+  // 2026-10-18（速くする）：v3 から次の 3 つを変えた。値は全部を数えたときと必ず同じ（tests/evalkp.test.js・tests/evalkp_wasm.test.js）。
+  //   (1) 玉のマスごとの覚え：側・玉のマス（81）ごとに、最後に数えた線形の部分（KP）と神経網の 1 層目と、そのときの盤・持ち駒を覚え、
+  //       玉が動いた側・近い手数に覚えが無いときは、覚えた盤との違いだけを足し引きする（v3 は KP を全部数え直していた）。
+  //   (2) 玉の周り 5×5 の数（玉の危なさの元の数 d の材料と、駒の組の点）を手数ごとに覚え、指した手が玉の周りに触れていなければ使い回す。
+  //       (1) で数え直した側は、覚えの盤との違いが玉の周りに無ければ、覚えと一緒にしまった周りの数を使う。
+  //   (3) 玉の周りを 1 回だけ見て、玉の危なさの材料と駒の組の点を一緒に数える。
+  //   ウェブアセンブリが使えるとき（engine/evalkp_wasm.js）は、(1) の足し引き・神経網の差分と出力・(3) の数え・走り駒の数をそちらで計算する。
   const MAXH = 4096, MAX_BACK = 6;
   const cLo = new Int32Array(MAXH), cHi = new Int32Array(MAXH), cOk = new Uint8Array(MAXH);
   const acc0 = new Int32Array(MAXH), acc1 = new Int32Array(MAXH);
   const bk0 = new Int8Array(MAXH), bk1 = new Int8Array(MAXH);   // 覚えた局面での玉の区分
   let nacc0 = new Int32Array(0), nacc1 = new Int32Array(0);
-  const stats = { hit: 0, diff: 0, full: 0, kingFull: 0, nnFull: 0, nnDiffSq: 0 };
+  // 玉の周りの数：手数 ply ごとに [攻め, 守り, 空き, 駒の組の点] × 2（先手の玉・後手の玉）
+  const NBC_JS = new Int32Array(MAXH * 8);
+  let NBC = NBC_JS;                        // ウェブアセンブリを使うときは、その記憶の中の同じ形の置き場（scan が直接書く）
+  const stats = { hit: 0, diff: 0, full: 0, kingFull: 0, nnFull: 0, nnDiffSq: 0, nearReuse: 0 };
   function resetCache() {
-    cOk.fill(0); fOk.fill(0);
-    stats.hit = stats.diff = stats.full = stats.kingFull = stats.nnFull = stats.nnDiffSq = 0;
+    cOk.fill(0); sOk.fill(0);
+    stats.hit = stats.diff = stats.full = stats.kingFull = stats.nnFull = stats.nnDiffSq = stats.nearReuse = 0;
+    if (WS !== null) WS.reset();
   }
   function allocCache() {
     if (nacc0.length !== MAXH * NH) { nacc0 = new Int32Array(MAXH * NH); nacc1 = new Int32Array(MAXH * NH); }
-    const n = 2 * NBK;
-    if (fAcc.length !== n * NH) fAcc = new Int32Array(n * NH);
-    if (fOk.length !== n) { fBoard = new Uint8Array(n * 81); fHand = new Uint8Array(n * 16); fOk = new Uint8Array(n); }
+    if (sAcc.length !== NSLOT * NH) sAcc = new Int32Array(NSLOT * NH);
     resetCache();
   }
 
-  // ===== 玉の区分ごとの覚え（v3。神経網の数え直しを軽くする。NNUE の「区分ごとの覚え」と同じ考え方）=====
-  // 側 c・玉の区分 b ごとに、最後にその区分で数えた 1 層目の値（H 個）と、そのときの盤（81 マス）・持ち駒を覚えておく。
-  // 数え直しが要るとき（玉の区分が変わった・近い手数に覚えが無い）は、全部を数える代わりに、覚えた盤と今の盤の
-  // 違うマス・持ち駒だけを足し引きする（1 層目は「区分ごとの重み × 特徴」の足し算なので、同じ区分なら違いだけで済む）。
-  let fAcc = new Int32Array(0), fBoard = new Uint8Array(0), fHand = new Uint8Array(0), fOk = new Uint8Array(0);
-  function refreshNN(pos, c, out, off) {
-    const H = NH, bk = BKC[kingRel(pos, c)], slot = c * NBK + bk, fo = slot * H, bo = slot * 81, ho = slot * 16;
-    const b = pos.board, h = pos.hands;
-    if (fOk[slot] === 0) {
-      fullNN(pos, c, fAcc, fo);
-      for (let i = 0; i < 81; i++) fBoard[bo + i] = b[SQ81[i]];
-      for (let k = 0; k < 16; k++) fHand[ho + k] = h[k];
-      fOk[slot] = 1;
-    } else {
-      const base = bk * NF * H, fb = c * 32 * NSQ;
-      for (let i = 0; i < 81; i++) {
-        const sq = SQ81[i], p = b[sq], old = fBoard[bo + i];
-        if (p === old) continue;
-        stats.nnDiffSq++;
-        if (old !== 0) {
-          const f = FB[fb + old * NSQ + sq];
-          if (f >= 0) { const r = base + f * H; for (let k = 0; k < H; k++) fAcc[fo + k] -= NW1[r + k]; }
-        }
-        if (p !== 0) {
-          const f = FB[fb + p * NSQ + sq];
-          if (f >= 0) { const r = base + f * H; for (let k = 0; k < H; k++) fAcc[fo + k] += NW1[r + k]; }
-        }
-        fBoard[bo + i] = p;
-      }
-      for (let color = 0; color < 2; color++) for (let t = 1; t <= 7; t++) {
-        const n = h[color * 8 + t], n0 = fHand[ho + color * 8 + t];
-        if (n === n0) continue;
-        const f0 = FE_HAND + (color ^ c) * NHAND + HOFF[t];
-        if (n > n0) for (let j = n0; j < n; j++) { const r = base + (f0 + j) * H; for (let k = 0; k < H; k++) fAcc[fo + k] += NW1[r + k]; }
-        else for (let j = n; j < n0; j++) { const r = base + (f0 + j) * H; for (let k = 0; k < H; k++) fAcc[fo + k] -= NW1[r + k]; }
-        fHand[ho + color * 8 + t] = n;
+  // c 側の玉（マス ks）から見て、マス sq が周り 5×5 に入るか（NEAR[ks * NSQ + sq]）
+  const ROW = X.ROW, COL = X.COL;
+  const NEAR = new Uint8Array(NSQ * NSQ);
+  for (let i = 0; i < 81; i++) for (let j = 0; j < 81; j++) {
+    const a = SQ81[i], b = SQ81[j];
+    if (Math.abs(ROW[a] - ROW[b]) <= 2 && Math.abs(COL[a] - COL[b]) <= 2) NEAR[a * NSQ + b] = 1;
+  }
+  // c 側の玉の周り 24 マスを 1 回見て、玉の危なさの材料（攻め・守り・空き）と駒の組の点を NBC[o..o+4) に入れる
+  // （kingDangerD・pairSum と同じ数え方。隅の玉で盤の配列の外を指したところは空きとして飛ばす。空きを数えるのは隣のマスだけなので同じ値）
+  function scanKing(b, ks, c, o) {
+    let att = 0, def = 0, holes = 0, s = 0, n = 0;
+    const pr = PR !== null;
+    for (let k = 0; k < 24; k++) {
+      const i = c === 0 ? k : 23 - k;
+      const p = b[ks + NOFF[i]] | 0;
+      if (p === WALL) continue;
+      if (p === 0) { if (NWT[i] === 2) holes++; continue; }
+      const t = p & 15, mine = (p >> 4) === c;
+      if (mine) def += DEF_W[t] * NWT[i]; else att += ATT_W[t] * NWT[i];
+      if (pr) {
+        const x = k * NPST + (t === K ? 18 : (mine ? 0 : 9) + KIND[t]);
+        const base = PRTRI[x];
+        for (let j = 0; j < n; j++) s += PR[base + PIT[j]];
+        PIT[n++] = x;
       }
     }
-    for (let k = 0; k < H; k++) out[off + k] = fAcc[fo + k];
+    NBC[o] = att; NBC[o + 1] = def; NBC[o + 2] = holes; NBC[o + 3] = s;
+  }
+  // c 側の玉の危なさの元の数 d（覚えた材料と今の持ち駒から。kingDangerD と同じ値）
+  function dangerD(h, c, o) {
+    const hb = (c ^ 1) << 3;
+    const pawns = h[hb + 1];
+    const ha = (pawns > 2 ? 2 : pawns) + h[hb + 2] * 2 + h[hb + 3] * 2 + h[hb + 4] * 3 +
+      h[hb + 5] * 3 + h[hb + 6] * 5 + h[hb + 7] * 4;
+    return NBC[o] * 3 + ha * (NBC[o + 2] + 2) - NBC[o + 1] * 2;
+  }
+  // 借りた特徴（hyBlack と同じ値）と駒の組（pairsBlack と同じ値）を、手数 ply に覚えた玉の周りの数から出す（先手から見た値）
+  function hyPairsAt(pos, ply) {
+    const o = ply * 8;
+    let s = 0;
+    if (wMob !== null) { wSlq.set(pos.slSq); s += wMob(); }
+    if (HMOB !== null) {
+      const b = pos.board, sl = pos.slSq;
+      if (wMob === null) for (let i = 0; i < 4; i++) {
+        const sq = sl[i];
+        if (sq === 0) continue;
+        const p = b[sq], v = HMOB[MOBK[p & 15] * 21 + mobCount(b, sq)];
+        s += (p >> 4) === 0 ? v : -v;
+      }
+      const h = pos.hands, d0 = dangerD(h, 0, o), d1 = dangerD(h, 1, o + 4);
+      if (HKS !== null) {
+        if (pos.side === 0) s += -dCurve(HKS, d0) + dCurve(HKO, d1);
+        else s += dCurve(HKS, d1) - dCurve(HKO, d0);
+      } else {
+        s -= kdCurve(d0 <= 0 ? 0 : Math.min(2200, (d0 * d0) >> 5));
+        s += kdCurve(d1 <= 0 ? 0 : Math.min(2200, (d1 * d1) >> 5));
+      }
+    }
+    if (PR !== null) s += NBC[o + 3] - NBC[o + 7];
+    return s;
+  }
+  // 手数 ply に覚えた値から、手番側から見た値（歩1枚≒100）にまとめる（finish と同じ値）
+  function finishAt(pos, ps, ply) {
+    let v = ps + acc0[ply] - acc1[ply] + (pos.side === 0 ? TEMPO : -TEMPO);
+    if (NEEDNB) v += hyPairsAt(pos, ply);
+    if (pos.side !== 0) v = -v;
+    if (NH > 0) v += wOut !== null ? wasmNNOut(pos.side, ply) : nnOut(pos.side, nacc0, ply * NH, nacc1, ply * NH);
+    return Math.floor((v + (ONE >> 1)) / ONE);
+  }
+  let NEEDNB = false;   // 借りた特徴か駒の組があるとき（玉の周りの数が要る）
+
+  // ===== 玉のマスごとの覚え =====
+  // 側 c・玉のマス kr（c から見た 0..80）ごとに、最後にそのマスで数えた KP の合計と神経網の 1 層目（H 個）、
+  // そのときの盤（143 マスの並びそのまま。4 バイトずつ比べるため 144 バイトごと）と持ち駒を覚える。
+  // ウェブアセンブリを使うときは、同じ覚えをウェブアセンブリの記憶に持つ（engine/evalkp_wasm.js の refresh）。
+  const NSLOT = 2 * 81, BSTR = 144;
+  const sOk = new Uint8Array(NSLOT), sKP = new Int32Array(NSLOT);
+  const sB = new Uint8Array(NSLOT * BSTR), sB32 = new Int32Array(sB.buffer), sH = new Uint8Array(NSLOT * 16);
+  let sAcc = new Int32Array(0);
+  // 玉の周りの数の覚え（側・玉のマスごとに [攻め, 守り, 空き, 駒の組の点]。覚えの盤と同じ時点の値）
+  const sNB = new Int32Array(NSLOT * 4);
+  // この評価で玉のマスごとの覚えから数え直したか（rfDone）・そのとき玉の周り 5×5 に違うマスがあったか（rfNear）・覚えの番号（rfSlot）
+  const rfDone = new Uint8Array(2), rfNear = new Uint8Array(2), rfSlot = new Int32Array(2);
+  // 盤のマス 23〜119 は 4 バイトの区切りで 5〜29 番目（その外は壁で変わらない）
+  const W_LO = 5, W_HI = 30;
+  let vB = null, vB32 = null;
+  function boardWords(b) {
+    if (b !== vB) {
+      vB = b;
+      vB32 = (b instanceof Uint8Array) && (b.byteOffset & 3) === 0 && b.length >= W_HI * 4 ? new Int32Array(b.buffer, b.byteOffset, W_HI) : null;
+    }
+    return vB32;
+  }
+  // 1 マスの違い（old → p）を、c 側の KP の合計 a と覚えの神経網 sAcc[so..] に足し引きする。新しい a を返す
+  function applySq(a, sq, old, p, fb, kb, nb, so) {
+    const H = NH;
+    if (old !== 0) {
+      const f = FB[fb + old * NSQ + sq];
+      if (f >= 0) { a -= KP[kb + f]; if (H > 0) { const r = nb + f * H; for (let k = 0; k < H; k++) sAcc[so + k] -= NW1[r + k]; } }
+    }
+    if (p !== 0) {
+      const f = FB[fb + p * NSQ + sq];
+      if (f >= 0) { a += KP[kb + f]; if (H > 0) { const r = nb + f * H; for (let k = 0; k < H; k++) sAcc[so + k] += NW1[r + k]; } }
+    }
+    return a;
+  }
+  // c 側の KP の合計を返し、神経網の 1 層目を nacc[o..o+H) に入れる（覚えとの違いだけを足し引き。初めてのマスは全部を数える）
+  function refresh(pos, c, nacc, o) {
+    const H = NH, kr = kingRel(pos, c), slot = c * 81 + kr, so = slot * H, bo = slot * BSTR, ho = slot * 16;
+    const b = pos.board, h = pos.hands, kn = pos.kingSq[c] * NSQ;
+    let a, near = sOk[slot] === 0;
+    if (sOk[slot] === 0) {
+      a = fullAcc(pos, c);
+      if (H > 0) fullNN(pos, c, sAcc, so);
+      for (let i = 0; i < NSQ; i++) sB[bo + i] = b[i];
+      for (let k = 0; k < 16; k++) sH[ho + k] = h[k];
+      sOk[slot] = 1;
+    } else {
+      a = sKP[slot];
+      const kb = kr * NF, nb = BKC[kr] * NF * H, fb = c * 32 * NSQ;
+      const b32 = boardWords(b);
+      if (b32 !== null) {
+        const w0 = bo >> 2;
+        for (let w = W_LO; w < W_HI; w++) {
+          const x = b32[w];
+          if (x === sB32[w0 + w]) continue;
+          for (let sq = w << 2, e = sq + 4; sq < e; sq++) {
+            const p = b[sq], old = sB[bo + sq];
+            if (p === old) continue;
+            stats.nnDiffSq++;
+            if (NEAR[kn + sq] !== 0) near = true;
+            a = applySq(a, sq, old, p, fb, kb, nb, so);
+          }
+          sB32[w0 + w] = x;
+        }
+      } else {
+        for (let i = 0; i < 81; i++) {
+          const sq = SQ81[i], p = b[sq], old = sB[bo + sq];
+          if (p === old) continue;
+          stats.nnDiffSq++;
+          if (NEAR[kn + sq] !== 0) near = true;
+          a = applySq(a, sq, old, p, fb, kb, nb, so);
+          sB[bo + sq] = p;
+        }
+      }
+      for (let color = 0; color < 2; color++) for (let t = 1; t <= 7; t++) {
+        const n = h[color * 8 + t], n0 = sH[ho + color * 8 + t];
+        if (n === n0) continue;
+        const f0 = FE_HAND + (color ^ c) * NHAND + HOFF[t];
+        if (n > n0) {
+          for (let j = n0; j < n; j++) {
+            a += KP[kb + f0 + j];
+            if (H > 0) { const r = nb + (f0 + j) * H; for (let k = 0; k < H; k++) sAcc[so + k] += NW1[r + k]; }
+          }
+        } else {
+          for (let j = n; j < n0; j++) {
+            a -= KP[kb + f0 + j];
+            if (H > 0) { const r = nb + (f0 + j) * H; for (let k = 0; k < H; k++) sAcc[so + k] -= NW1[r + k]; }
+          }
+        }
+        sH[ho + color * 8 + t] = n;
+      }
+    }
+    sKP[slot] = a;
+    for (let k = 0; k < H; k++) nacc[o + k] = sAcc[so + k];
+    rfDone[c] = 1; rfNear[c] = near ? 1 : 0; rfSlot[c] = slot;
+    return a;
   }
 
   // 手 j（pos.moveStack[j]）を指した直後の、color 側の持ち駒 t の枚数（今の枚数から、j より後の手の分を戻す）
@@ -42693,6 +43655,64 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
   const chF = new Int32Array(256), chS = new Int8Array(256), chC = new Int8Array(256);
   let nch = 0;
   function push(c, f, s) { if (f >= 0) { chC[nch] = c; chF[nch] = f; chS[nch] = s; nch++; } }
+  // 手数 q の後に指した手（q+1..ply）から、変わった特徴を集める。玉が動いたか（gMoved0・1）、
+  // 指した手が玉の周り 5×5 に触れたか（gNear0・1）も見る
+  let gMoved0 = false, gMoved1 = false, gNear0 = false, gNear1 = false;
+  function collect(pos, q, ply) {
+    const ms = pos.moveStack, ks0 = pos.kingSq[0] * NSQ, ks1 = pos.kingSq[1] * NSQ, fw = 32 * NSQ;
+    let fullB = false, fullW = false, near0 = false, near1 = false;
+    nch = 0;
+    for (let j = q + 1; j <= ply; j++) {
+      const m = ms[j];
+      if (m === 0) continue;                                          // パス（null move）は駒が動かない
+      const to = m & 255, from = (m >>> 8) & 255, pc = (m >>> 17) & 31, us = pc >> 4;
+      if (NEAR[ks0 + to] !== 0 || NEAR[ks0 + from] !== 0) near0 = true;
+      if (NEAR[ks1 + to] !== 0 || NEAR[ks1 + from] !== 0) near1 = true;
+      if (from === 0) {
+        const t = pc & 15, n = handAfter(pos, j, ply, us, t);        // 打った後の枚数（打った駒は n+1 枚目）
+        push(0, FB[pc * NSQ + to], 1); push(1, FB[fw + pc * NSQ + to], 1);
+        push(0, featHand(0, us, t, n + 1), -1); push(1, featHand(1, us, t, n + 1), -1);
+      } else {
+        if ((pc & 15) === K) { if (us === 0) fullB = true; else fullW = true; }
+        const np = (m & PROMO) !== 0 ? pc + 8 : pc, cap = (m >>> 22) & 31;
+        push(0, FB[np * NSQ + to], 1); push(1, FB[fw + np * NSQ + to], 1);
+        push(0, FB[pc * NSQ + from], -1); push(1, FB[fw + pc * NSQ + from], -1);
+        if (cap !== 0) {
+          const ct = BASE[cap & 15], n = handAfter(pos, j, ply, us, ct);   // 取った駒は n 枚目
+          push(0, featHand(0, us, ct, n), 1); push(1, featHand(1, us, ct, n), 1);
+          push(0, FB[cap * NSQ + to], -1); push(1, FB[fw + cap * NSQ + to], -1);
+        }
+      }
+    }
+    gMoved0 = fullB; gMoved1 = fullW; gNear0 = near0; gNear1 = near1;
+    if (fullB || fullW) stats.kingFull++; else stats.diff++;
+  }
+  // 玉の周りの数（c 側）：
+  //   この評価で玉のマスごとの覚えから数え直した側は、覚えの盤との違いが玉の周り 5×5 に無ければ覚えの値を使い、あれば数えて覚え直す。
+  //   そうでない側は、指した手が玉の周りに触れていれば数え、触れていなければ手数 q の値を写す。
+  function nearSide(pos, c, q, ply, touched) {
+    const po = ply * 8 + c * 4;
+    if (rfDone[c] !== 0) {
+      const so = rfSlot[c] * 4;
+      if (rfNear[c] === 0) { NBC[po] = sNB[so]; NBC[po + 1] = sNB[so + 1]; NBC[po + 2] = sNB[so + 2]; NBC[po + 3] = sNB[so + 3]; stats.nearReuse++; }
+      else { scanSide(pos, c, po); sNB[so] = NBC[po]; sNB[so + 1] = NBC[po + 1]; sNB[so + 2] = NBC[po + 2]; sNB[so + 3] = NBC[po + 3]; }
+    } else if (touched) scanSide(pos, c, po);
+    else { const qq = q * 8 + c * 4; NBC[po] = NBC[qq]; NBC[po + 1] = NBC[qq + 1]; NBC[po + 2] = NBC[qq + 2]; NBC[po + 3] = NBC[qq + 3]; stats.nearReuse++; }
+  }
+  function scanSide(pos, c, po) {
+    if (wScan !== null) wScan(c, pos.kingSq[c], wNBC + po * 4);   // 盤は評価の初めにウェブアセンブリの記憶へ写してある
+    else scanKing(pos.board, pos.kingSq[c], c, po);
+  }
+  function nearUpdate(pos, q, ply) {
+    nearSide(pos, 0, q, ply, gMoved0 || gNear0);
+    nearSide(pos, 1, q, ply, gMoved1 || gNear1);
+  }
+  // 近い手数（MAX_BACK 手まで）で、今の手順の局面と同じ局面を覚えている手数（無ければ -1）
+  function findBack(pos, ply) {
+    const lim = ply - MAX_BACK < 0 ? 0 : ply - MAX_BACK, hLo = pos.hLo, hHi = pos.hHi;
+    for (let i = ply - 1; i >= lim; i--) if (cOk[i] === 1 && cLo[i] === hLo[i] && cHi[i] === hHi[i]) return i;
+    return -1;
+  }
 
   function evaluate(pos) {
     if (KP === null) init();
@@ -42701,63 +43721,37 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     if (ply >= MAXH) return evaluateFull(pos);
     if (cOk[ply] === 1 && cLo[ply] === pos.hashLo && cHi[ply] === pos.hashHi) {
       stats.hit++;
-      return finish(pos, ps, acc0[ply], acc1[ply], H > 0 ? nnOut(pos.side, nacc0, ply * H, nacc1, ply * H) : 0);
+      if (wMob !== null) wBoard.set(pos.board);
+      return finishAt(pos, ps, ply);
     }
     const kr0 = kingRel(pos, 0), kr1 = kingRel(pos, 1), b0 = BKC[kr0], b1 = BKC[kr1];
-    let a0 = 0, a1 = 0, q = -1;
-    {
-      const lim = ply - MAX_BACK < 0 ? 0 : ply - MAX_BACK, hLo = pos.hLo, hHi = pos.hHi;
-      for (let i = ply - 1; i >= lim; i--) if (cOk[i] === 1 && cLo[i] === hLo[i] && cHi[i] === hHi[i]) { q = i; break; }
-    }
-    const o = ply * H;
-    if (q < 0) {
-      a0 = fullAcc(pos, 0); a1 = fullAcc(pos, 1);
-      if (H > 0) { refreshNN(pos, 0, nacc0, o); refreshNN(pos, 1, nacc1, o); }
+    const q = findBack(pos, ply);
+    rfDone[0] = rfDone[1] = 0;
+    if (wDiff !== null) {
+      wBoard.set(pos.board);   // ウェブアセンブリの計算は盤をその記憶から読む（143 バイトを写す）
+      evalStepWasm(pos, ply, q, kr0, kr1, b0, b1);
+    } else if (q < 0) {
+      const o = ply * H;
+      acc0[ply] = refresh(pos, 0, nacc0, o); acc1[ply] = refresh(pos, 1, nacc1, o);
       stats.full++;
     } else {
-      a0 = acc0[q]; a1 = acc1[q];
-      const ms = pos.moveStack;
-      let fullB = false, fullW = false;
-      // 変わった特徴を集める
-      nch = 0;
-      const fw = 32 * NSQ;
-      for (let j = q + 1; j <= ply; j++) {
-        const m = ms[j];
-        if (m === 0) continue;                                          // パス（null move）は駒が動かない
-        const to = m & 255, from = (m >>> 8) & 255, pc = (m >>> 17) & 31, us = pc >> 4;
-        if (from === 0) {
-          const t = pc & 15, n = handAfter(pos, j, ply, us, t);        // 打った後の枚数（打った駒は n+1 枚目）
-          push(0, FB[pc * NSQ + to], 1); push(1, FB[fw + pc * NSQ + to], 1);
-          push(0, featHand(0, us, t, n + 1), -1); push(1, featHand(1, us, t, n + 1), -1);
-        } else {
-          if ((pc & 15) === K) { if (us === 0) fullB = true; else fullW = true; }
-          const np = (m & PROMO) !== 0 ? pc + 8 : pc, cap = (m >>> 22) & 31;
-          push(0, FB[np * NSQ + to], 1); push(1, FB[fw + np * NSQ + to], 1);
-          push(0, FB[pc * NSQ + from], -1); push(1, FB[fw + pc * NSQ + from], -1);
-          if (cap !== 0) {
-            const ct = BASE[cap & 15], n = handAfter(pos, j, ply, us, ct);   // 取った駒は n 枚目
-            push(0, featHand(0, us, ct, n), 1); push(1, featHand(1, us, ct, n), 1);
-            push(0, FB[cap * NSQ + to], -1); push(1, FB[fw + cap * NSQ + to], -1);
-          }
+      collect(pos, q, ply);
+      // 玉が動いた側は、玉のマスごとの覚えから数え直す。動いていない側は q の値に足し引きする
+      const o = ply * H, qo = q * H;
+      for (let c = 0; c < 2; c++) {
+        const acc = c === 0 ? acc0 : acc1, nacc = c === 0 ? nacc0 : nacc1;
+        if (c === 0 ? gMoved0 : gMoved1) {
+          if ((c === 0 ? bk0[q] : bk1[q]) !== (c === 0 ? b0 : b1)) stats.nnFull++;
+          acc[ply] = refresh(pos, c, nacc, o);
+          continue;
         }
-      }
-      // 線形の部分
-      const kb = kr0 * NF, kw = kr1 * NF;
-      for (let i = 0; i < nch; i++) {
-        if (chC[i] === 0) { if (!fullB) a0 += chS[i] * KP[kb + chF[i]]; }
-        else if (!fullW) a1 += chS[i] * KP[kw + chF[i]];
-      }
-      if (fullB) a0 = fullAcc(pos, 0);
-      if (fullW) a1 = fullAcc(pos, 1);
-      if (fullB || fullW) stats.kingFull++; else stats.diff++;
-      // 神経網の部分（玉の区分が変わった側は、区分ごとの覚えから数え直す）
-      if (H > 0) {
-        const qo = q * H;
-        for (let c = 0; c < 2; c++) {
-          const nacc = c === 0 ? nacc0 : nacc1, bc = c === 0 ? b0 : b1;
-          if ((c === 0 ? bk0[q] : bk1[q]) !== bc) { refreshNN(pos, c, nacc, o); stats.nnFull++; continue; }
+        let a = acc[q];
+        const kb = (c === 0 ? kr0 : kr1) * NF;
+        for (let i = 0; i < nch; i++) if (chC[i] === c) a += chS[i] * KP[kb + chF[i]];
+        acc[ply] = a;
+        if (H > 0) {
           for (let k = 0; k < H; k++) nacc[o + k] = nacc[qo + k];
-          const base = bc * NF * H;
+          const base = (c === 0 ? b0 : b1) * NF * H;
           for (let i = 0; i < nch; i++) {
             if (chC[i] !== c) continue;
             const r = base + chF[i] * H;
@@ -42767,8 +43761,138 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
         }
       }
     }
-    cLo[ply] = pos.hashLo; cHi[ply] = pos.hashHi; acc0[ply] = a0; acc1[ply] = a1; bk0[ply] = b0; bk1[ply] = b1; cOk[ply] = 1;
-    return finish(pos, ps, a0, a1, H > 0 ? nnOut(pos.side, nacc0, o, nacc1, o) : 0);
+    if (NEEDNB) nearUpdate(pos, q, ply);
+    cLo[ply] = pos.hashLo; cHi[ply] = pos.hashHi; bk0[ply] = b0; bk1[ply] = b1; cOk[ply] = 1;
+    return finishAt(pos, ps, ply);
+  }
+
+  // ===== ウェブアセンブリを使う計算（engine/evalkp_wasm.js）=====
+  // 流れ（どの手数の値から足すか・変わった特徴を集める・玉が動いたか・周りに触れたか）は JS と同じ。
+  // 玉のマスごとの覚えの足し引き（refresh）・神経網の差分（diff）・出力（out）・玉の周りの数（scan）・走り駒の数（mob）をウェブアセンブリで計算する。
+  // 手数ごとの 1 層目（wN0・wN1 から）と玉の周りの数（NBC）はウェブアセンブリの記憶に置く。KP の合計（acc0・acc1）は JS のまま。
+  let wDiff = null, wRefresh = null, wOut = null, wAdd = null, wSub = null, wBoard = null, wHands = null, wFlag = null;
+  let wScan = null, wMob = null, wSlq = null;
+  let wN0 = 0, wN1 = 0, wW1 = 0, wKP = 0, wFB = 0, wHF = 0, wNM = 0, wNBC = 0, wasmNearOff = false;
+  function useWs(ws) {
+    WS = ws;
+    if (ws === null) { wDiff = wRefresh = wOut = wAdd = wSub = wBoard = wHands = wFlag = wScan = wMob = wSlq = null; NBC = NBC_JS; return; }
+    wDiff = ws.fDiff; wRefresh = ws.fRefresh; wOut = ws.fOut;
+    wAdd = ws.addList; wSub = ws.subList; wBoard = ws.board; wHands = ws.hands; wFlag = ws.flag;
+    wN0 = ws.N0; wN1 = ws.N1; wW1 = ws.W1; wKP = ws.KPOFF; wFB = ws.FBOFF; wHF = ws.HFOFF; wNM = ws.NMOFF;
+    // 玉の周りの数と走り駒の数（借りた特徴か駒の組があるときだけ）
+    wScan = wasmNearOff ? null : ws.fScan; wMob = HMOB !== null && !wasmNearOff ? ws.fMob : null; wSlq = ws.slq; wNBC = ws.NBCOFF;
+    NBC = wScan !== null ? ws.nbc : NBC_JS;
+  }
+  function wasmNNOut(side, ply) {
+    const o = ply * NH * 4;
+    const s = side === 0 ? wOut(wN0 + o, wN1 + o) : wOut(wN1 + o, wN0 + o);
+    return s / NQA + NB2;
+  }
+  // c 側の玉のマス kr の覚えから数え直す（今の盤と持ち駒は先に wBoard・wHands に写しておく）
+  function wasmRefresh(c, kr, ply, ks) {
+    const slot = c * 81 + kr;
+    const a = wRefresh(slot, wKP + kr * NF * 2, wW1 + BKC[kr] * NF * NH * 2, wFB + c * 32 * NSQ * 2, wHF + c * 64,
+      (c === 0 ? wN0 : wN1) + ply * NH * 4, wNM + ks * 32);
+    rfDone[c] = 1; rfNear[c] = wFlag[0] !== 0 ? 1 : 0; rfSlot[c] = slot;
+    return a;
+  }
+  function evalStepWasm(pos, ply, q, kr0, kr1, b0, b1) {
+    const H = NH;
+    if (q < 0) {
+      wHands.set(pos.hands);
+      acc0[ply] = wasmRefresh(0, kr0, ply, pos.kingSq[0]); acc1[ply] = wasmRefresh(1, kr1, ply, pos.kingSq[1]);
+      stats.full++;
+      return;
+    }
+    collect(pos, q, ply);
+    let loaded = false;
+    const st = H * 2, o4 = ply * H * 4, q4 = q * H * 4;
+    for (let c = 0; c < 2; c++) {
+      const acc = c === 0 ? acc0 : acc1;
+      if (c === 0 ? gMoved0 : gMoved1) {
+        if ((c === 0 ? bk0[q] : bk1[q]) !== (c === 0 ? b0 : b1)) stats.nnFull++;
+        if (!loaded) { wHands.set(pos.hands); loaded = true; }
+        acc[ply] = wasmRefresh(c, c === 0 ? kr0 : kr1, ply, pos.kingSq[c]);
+        continue;
+      }
+      let a = acc[q], na = 0, ns = 0;
+      const kb = (c === 0 ? kr0 : kr1) * NF, wb = wW1 + (c === 0 ? b0 : b1) * NF * st;
+      for (let i = 0; i < nch; i++) {
+        if (chC[i] !== c) continue;
+        const f = chF[i];
+        if (chS[i] > 0) { a += KP[kb + f]; wAdd[na++] = wb + f * st; }
+        else { a -= KP[kb + f]; wSub[ns++] = wb + f * st; }
+      }
+      acc[ply] = a;
+      const nb = c === 0 ? wN0 : wN1;
+      wDiff(nb + o4, nb + q4, na, ns);
+    }
+  }
+  // ウェブアセンブリの部品を探す（Node は ./evalkp_wasm.js、ページ・Worker は root.ShogiEvalKPWasm）
+  function wasmLib() {
+    if (root && root.ShogiEvalKPWasm) return root.ShogiEvalKPWasm;
+    if (typeof module === 'object' && module.exports && typeof require === 'function') {
+      try { return require('./evalkp_wasm.js'); } catch (e) { return null; }
+    }
+    return null;
+  }
+  // 使えるならウェブアセンブリを用意して、でたらめな手順で JS の全部を数えた値と同じになるかを確かめる（違えば JS に戻す）
+  function setupWasm() {
+    const lib = wasmLib();
+    if (!lib) { info.wasmNote = 'evalkp_wasm.js が読み込まれていない'; return; }
+    if (NH === 0) { info.wasmNote = '神経網が無い（速くする所が無い）'; return; }
+    const t0 = Date.now();
+    const HF = new Int32Array(32);
+    for (let c = 0; c < 2; c++) for (let idx = 0; idx < 16; idx++) {
+      const t = idx & 7;
+      if (t >= 1) HF[c * 16 + idx] = FE_HAND + ((idx >> 3) ^ c) * NHAND + HOFF[t];
+    }
+    const empty = new Uint8Array(BSTR).fill(WALL);
+    for (let i = 0; i < 81; i++) empty[SQ81[i]] = 0;
+    // 玉のマス ks ごとに、盤のバイト 16〜127 を 16 個ずつ区切った 7 つの欄で、周り 5×5 に入るマスの印（16 ビット）
+    const NM = new Int32Array(NSQ * 8);
+    for (let ks = 0; ks < NSQ; ks++) for (let ci = 0; ci < 7; ci++) {
+      let mk = 0;
+      for (let bit = 0; bit < 16; bit++) if (NEAR[ks * NSQ + 16 + ci * 16 + bit] !== 0) mk |= 1 << bit;
+      NM[ks * 8 + ci] = mk;
+    }
+    const ws = lib.create({
+      H: NH, NQA, NSQ, W1: NW1, B1: NB1, W2: NW2, KP, FB, HF, NM, nslot: NSLOT, maxh: MAXH, emptyBoard: empty,
+      needNB: NEEDNB, PR, HMOB, SS: SLIDE_START, SL: SLIDE_LIST, MOBK: Int32Array.from(MOBK), DEFW: DEF_W, ATTW: ATT_W, KIND,
+    });
+    if (!ws) { info.wasmNote = lib.lastError || '作れなかった'; return; }
+    useWs(ws);
+    let bad = null;
+    try { bad = selfCheck(); } catch (e) { bad = String((e && e.message) || e); }
+    resetCache();
+    if (bad !== null) { useWs(null); resetCache(); info.wasmNote = '確かめで値が違った（JS に戻した）: ' + bad; return; }
+    info.wasm = true; info.wasmMs = Date.now() - t0; info.wasmCopyMs = ws.ms; info.wasmBytes = ws.bytes; info.wasmMem = ws.memBytes;
+  }
+  // 確かめ：決まった手順（でたらめに選ぶ。玉の手を多めに）を指しながら、全部を数えた値と比べる。
+  // 10 手ごとに 7 手続けて評価しないところを作り、近い手数に覚えが無いとき（玉のマスごとの覚えとの違いを足し引き）・
+  // 何手分もまとめた差分・玉が動いた側だけの数え直し・パス・戻したときを通す。違えば理由の文字列を返す
+  function selfCheck() {
+    const p = new Core.Position();
+    p.setEvalTables(PST, HANDV);
+    p.setSfen(Core.STARTPOS);
+    const buf = new Int32Array(1024), made = [];
+    let x = 20261018;
+    const rand = (n) => { x = (Math.imul(x, 1103515245) + 12345) >>> 0; return (x >>> 8) % n; };
+    for (let i = 0; i < 60; i++) {
+      if (i % 10 < 3) { const a = evaluate(p), b = evaluateFull(p); if (a !== b) return (i + 1) + ' 手目 ' + a + ' ≠ ' + b; }
+      const n = p.genLegal(buf, 0, 0);
+      if (n === 0) break;
+      let m = buf[rand(n)];
+      if (rand(3) === 0) { const k = []; for (let j = 0; j < n; j++) if (((buf[j] >>> 17) & 15) === K) k.push(buf[j]); if (k.length > 0) m = k[rand(k.length)]; }
+      p.makeMove(m); made.push(m);
+    }
+    while (made.length > 0) {
+      p.unmakeMove(made.pop());
+      if (made.length % 4 === 0 && !p.inCheck()) { p.makeNull(); const a = evaluate(p), b = evaluateFull(p); p.unmakeNull(); if (a !== b) return 'パス ' + a + ' ≠ ' + b; }
+      const a = evaluate(p), b = evaluateFull(p);
+      if (a !== b) return '戻して ' + made.length + ' 手目 ' + a + ' ≠ ' + b;
+    }
+    return null;
   }
 
   // ShogiSearch.setEvaluator にそのまま渡せる形
@@ -42794,11 +43918,20 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
 });
 </script>
 <script id="src-worker" type="text/plain">
-/* Web Worker のメッセージ処理。ページは core.js＋mate.js＋book.js＋weights_kp.js＋evalkp.js＋search.js＋worker.js を
- * この順に連結した Blob から Worker を作る（無い部品は飛ばす。search.js は root.ShogiBook・ShogiMate・ShogiEvalKP があれば使う）。
+/* Web Worker のメッセージ処理。ページは core.js＋mate.js＋book.js＋weights_kp.js＋evalkp_wasm.js＋evalkp.js＋search.js＋worker.js を
+ * この順に連結した Blob から Worker を作る（無い部品は飛ばす。search.js は root.ShogiBook・ShogiMate・ShogiEvalKP があれば使う。
+ * evalkp.js は init のときに root.ShogiEvalKPWasm があれば重い計算をウェブアセンブリで行う）。
  * worker → { type:'ready' }（読み込みが済んだら1回。本体の見張りに「動いている」と知らせる）
  * 本体 → { type:'go', id, startSfen, moves, level }
- * worker → { type:'info', ... }（深さごと・0.2秒に1回まで）／{ type:'bestmove', ... }／{ type:'error', id, message } */
+ * worker → { type:'info', ... }（深さごと・0.2秒に1回まで）／{ type:'bestmove', ... }／{ type:'error', id, message }
+ *
+ * 並列の読み（設計 §15。ページがクロスオリジン分離されているときだけ）：
+ * 本体 → { type:'smp', role:'main'|'helper', index, tt, ctl }（tt・ctl は ShogiSearch.SMP.create で作った SharedArrayBuffer）
+ * worker → { type:'smp-ready', role, index, ttBits }／{ type:'smp-error', index, message }
+ *   主（role 'main'・index 0）：以後の go で共有の置換表を使い、Lv4〜7 では手伝いに同じ局面を読んでもらう。
+ *     go の id 以上の番号で本体が ShogiSearch.SMP.abort(ctl, id) を呼ぶと、読みを途中でやめて bestmove を返す（本体は捨てる）。
+ *   手伝い（role 'helper'・index 1〜）：smp-ready を返したあと、主の仕事を待って読むだけになる（ほかの知らせは受けない。
+ *     止めるのは本体の terminate）。 */
 (function (root) {
   'use strict';
   const Search = root.ShogiSearch;
@@ -42806,9 +43939,27 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
   if (!Search || typeof root.postMessage !== 'function' || typeof root.document !== 'undefined') return;
   const now = (typeof performance !== 'undefined' && performance && typeof performance.now === 'function')
     ? () => performance.now() : () => Date.now();
+  let smp = null;   // 共有の表につないだら { role, index, ttBits }
+
+  function onSmp(msg) {
+    let r;
+    try {
+      if (smp) throw new Error('もうつないであります');
+      if (!Search.SMP) throw new Error('この探索は並列の読みに対応していません');
+      r = Search.SMP.attach({ tt: msg.tt, ctl: msg.ctl, role: msg.role, index: msg.index });
+      smp = r;
+    } catch (err) {
+      root.postMessage({ type: 'smp-error', index: msg.index, message: String((err && err.message) || err) });
+      return;
+    }
+    root.postMessage({ type: 'smp-ready', role: r.role, index: r.index, ttBits: r.ttBits });
+    // 手伝いはここから戻らない（主の仕事を Atomics.wait で待って読む）
+    if (r.role === 'helper') Search.SMP.helperLoop();
+  }
 
   root.onmessage = function (e) {
     const msg = e && e.data;
+    if (msg && msg.type === 'smp') { onSmp(msg); return; }
     if (!msg || msg.type !== 'go') return;
     const id = msg.id;
     try {
@@ -42819,7 +43970,7 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
       }
       if (!Search.LEVELS.some((x) => x.level === msg.level)) throw new Error('level が不正です: ' + msg.level);
       let last = -Infinity;
-      const res = Search.search({
+      const opts = {
         startSfen: msg.startSfen,
         moves: msg.moves,
         level: msg.level,
@@ -42832,13 +43983,17 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
             nodes: info.nodes, nps: info.nps, pv: info.pv,
           });
         },
-      });
+      };
+      // 並列の主：本体からの「止めて」をこの id で見る（id が正の整数のときだけ）
+      if (smp && smp.role === 'main' && Number.isInteger(id) && id > 0) opts.abortId = id;
+      const res = Search.search(opts);
       const out = {
         type: 'bestmove', id, bestmove: res.bestmove, score: res.score, mate: res.mate,
         depth: res.depth, nodes: res.nodes, timeMs: res.timeMs, pv: res.pv,
       };
       if (res.book) out.book = true;              // 定跡の手
       if (res.mateSearch) out.mateSearch = true;  // 詰み探索で見つけた手順
+      if (res.threads) out.threads = res.threads; // 並列で読んだ本数（主を含む）
       root.postMessage(out);
     } catch (err) {
       root.postMessage({ type: 'error', id, message: String((err && err.message) || err) });
@@ -43272,6 +44427,23 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     return out;
   }
 
+  /* ---------- 並列の読み（設計 §15） ---------- */
+
+  // AI に使う Worker の数（主を含む）。1 なら今までどおり Worker 1つ。
+  //   isolated：ページがクロスオリジン分離されている（crossOriginIsolated が true）か。そうでなければ SharedArrayBuffer が使えないので 1
+  //   cores：navigator.hardwareConcurrency（論理コアの数）。分からなければ 1
+  //   mobile：指で操作する端末か（電池と熱のため、上限を下げる）
+  // 1つは画面のために空ける（cores − 1）。上限はパソコン 6・スマホ 4。
+  const SMP_CAP_DESKTOP = 6, SMP_CAP_MOBILE = 4;
+  function smpWorkerCount(env) {
+    const e = env || {};
+    if (e.isolated !== true) return 1;
+    const cores = Number(e.cores);
+    if (!Number.isInteger(cores) || cores < 2) return 1;
+    const cap = e.mobile ? SMP_CAP_MOBILE : SMP_CAP_DESKTOP;
+    return Math.max(1, Math.min(cap, cores - 1));
+  }
+
   /* ---------- 読み上げの文 ---------- */
 
   function squareAria(sq, code, handicapped, note) {
@@ -43294,6 +44466,7 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     normalizeLevels, findLevel, clampLevel, levelName, aiDisplayName, levelFromV1,
     serializeState, parseSavedState, SAVE_VERSION,
     pvNotation, squareAria,
+    smpWorkerCount, SMP_CAP_DESKTOP, SMP_CAP_MOBILE,
   };
 });
 </script>
@@ -43400,7 +44573,11 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     outeTimer: 0, toastTimer: 0,
   };
 
-  const W = { w: null, url: '', spoke: false, everSpoke: false, broken: false, dog: 0 };
+  // Worker の状態。w＝主（go を受ける Worker）。並列の読み（設計 §15）のときは helpers に手伝いの Worker、smp に共有の表
+  const W = {
+    w: null, url: '', spoke: false, everSpoke: false, broken: false, dog: 0,
+    smp: null, smpBroken: false, helpers: [], hurl: '', hpending: 0,
+  };
 
   function touch() { S.ver++; }
   function aiSide() { return L.opposite(S.humanSide); }
@@ -43934,16 +45111,101 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
 
   /* ---------- AI に考えさせる ---------- */
 
-  // Worker の中で読む順（設計 §2）：core → 詰み探索 → 定跡 → 評価の重み → 学習した評価 → search → worker。
-  // 詰み探索・定跡・重み・学習した評価は本体では走らせない（type="text/plain"）。無い部品は飛ばす。
-  const WORKER_PARTS = ['src-core', 'src-mate', 'src-book', 'src-weights', 'src-evalkp', 'src-search', 'src-worker'];
-  const EXTRA_PARTS = ['src-mate', 'src-book', 'src-weights', 'src-evalkp'];
+  // Worker の中で読む順（設計 §2）：core → 詰み探索 → 定跡 → 評価の重み → 評価のウェブアセンブリ → 学習した評価 → search → worker。
+  // 詰み探索・定跡・重み・評価のウェブアセンブリ・学習した評価は本体では走らせない（type="text/plain"）。無い部品は飛ばす。
+  // 評価のウェブアセンブリ（evalkp_wasm）は学習した評価（evalkp）の init より前に読めていればよいので、evalkp の直前に置く。
+  const WORKER_PARTS = ['src-core', 'src-mate', 'src-book', 'src-weights', 'src-evalkp-wasm', 'src-evalkp', 'src-search', 'src-worker'];
+  // 並列の読みの手伝いの Worker：定跡と詰み探索は主だけが使うので入れない（読み込みとメモリを軽くする）。
+  // 評価は主と同じ物を使う（共有の置換表に違う評価の値を混ぜないため）
+  const HELPER_PARTS = ['src-core', 'src-weights', 'src-evalkp-wasm', 'src-evalkp', 'src-search', 'src-worker'];
+  const EXTRA_PARTS = ['src-mate', 'src-book', 'src-weights', 'src-evalkp-wasm', 'src-evalkp'];
 
-  function workerSource() {
-    return WORKER_PARTS.map((id) => {
+  function workerSource(parts) {
+    return (parts || WORKER_PARTS).map((id) => {
       const s = $(id);
       return s ? s.textContent : '';
     }).filter((t) => t.trim()).join('\n;\n');
+  }
+
+  // 並列の読み（設計 §15）：ページがクロスオリジン分離されているとき（公開用の一式を service worker 越しに開いたとき）だけ、
+  // 主の Worker のほかに手伝いの Worker を作り、Lv4〜7 を一緒に読ませる。何本にするかは ui/logic.js の smpWorkerCount。
+  // 分離されていない（ダブルクリック版・claude.ai 版・古いブラウザ）・作れない・落ちたときは、今までどおり Worker 1つで読む。
+  function smpPlan() {
+    let isolated = false, cores = 0, mobile = false;
+    try {
+      isolated = window.crossOriginIsolated === true && typeof SharedArrayBuffer === 'function' &&
+        typeof Atomics === 'object' && !!(Search.SMP && typeof Search.SMP.create === 'function');
+    } catch (e) { isolated = false; }
+    try { cores = Number(window.navigator && window.navigator.hardwareConcurrency) || 0; } catch (e) { cores = 0; }
+    try {
+      const nav = window.navigator || {};
+      mobile = !!(nav.userAgentData && nav.userAgentData.mobile === true) ||
+        !!(typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches);
+    } catch (e) { mobile = false; }
+    return L.smpWorkerCount({ isolated, cores, mobile });
+  }
+
+  function revokeHelperUrl() {
+    if (W.hurl) {
+      try { URL.revokeObjectURL(W.hurl); } catch (e) { /* 何もしない */ }
+      W.hurl = '';
+    }
+  }
+  function helperSettled() {
+    W.hpending--;
+    if (W.hpending <= 0) revokeHelperUrl();
+  }
+  function dropHelper(h, k) {
+    const i = W.helpers.indexOf(h);
+    if (i < 0) return;
+    W.helpers.splice(i, 1);
+    try { h.terminate(); } catch (e) { /* 何もしない */ }
+    if (W.smp) { try { Search.SMP.markDead(W.smp.ctl, k); } catch (e) { /* 何もしない */ } }
+  }
+  function killHelpers() {
+    for (const h of W.helpers) { try { h.terminate(); } catch (e) { /* 何もしない */ } }
+    W.helpers = [];
+    W.hpending = 0;
+    revokeHelperUrl();
+  }
+
+  // 主の Worker w を共有の表につなぎ、手伝いを作る。うまくいかなければ何もしない（主1つで読む）
+  function startSmp(w) {
+    W.smp = null;
+    if (W.smpBroken) return;
+    const n = smpPlan();
+    if (n < 2) return;
+    let shared = null;
+    try { shared = Search.SMP.create(); } catch (e) { shared = null; }
+    if (!shared) { W.smpBroken = true; return; }
+    try {
+      w.postMessage({ type: 'smp', role: 'main', index: 0, tt: shared.tt, ctl: shared.ctl });
+    } catch (e) { W.smpBroken = true; return; }
+    W.smp = { tt: shared.tt, ctl: shared.ctl, n };
+    try {
+      const src = workerSource(HELPER_PARTS);
+      if (!src.trim()) return;
+      W.hurl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+      for (let k = 1; k < n; k++) {
+        const h = new Worker(W.hurl);
+        let settled = false;
+        h.onmessage = (e) => {
+          const d = e && e.data;
+          if (!d || typeof d !== 'object') return;
+          if (d.type === 'ready' && !settled) { settled = true; helperSettled(); }
+          else if (d.type === 'smp-error') dropHelper(h, k);
+        };
+        h.onerror = (e) => {
+          if (e && typeof e.preventDefault === 'function') e.preventDefault();
+          if (!settled) { settled = true; helperSettled(); }
+          dropHelper(h, k);   // 落ちた手伝いは使わない（主と残りの手伝いで読む）
+        };
+        h.postMessage({ type: 'smp', role: 'helper', index: k, tt: shared.tt, ctl: shared.ctl });
+        W.helpers.push(h);
+        W.hpending++;
+      }
+    } catch (e) { /* 作れた手伝いだけで読む */ }
+    if (W.hpending <= 0) revokeHelperUrl();
   }
 
   // Worker が使えないとき：本体でも詰み探索・定跡・学習した評価を使えるよう、一度だけ本体で読む。
@@ -43987,6 +45249,8 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
       w.onmessage = (e) => onWorkerMessage(w, e.data);
       w.onerror = (e) => onWorkerError(w, e);
       W.w = w;
+      // 並列の読み（分離されているときだけ）。何が起きても主1つの読みは止めない
+      try { startSmp(w); } catch (e) { W.smpBroken = true; killHelpers(); W.smp = null; }
       return w;
     } catch (e) {
       W.broken = true;
@@ -44002,6 +45266,8 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
       W.w = null;
     }
     revokeUrl();
+    killHelpers();
+    W.smp = null;
   }
 
   function onWorkerMessage(w, d) {
@@ -44012,6 +45278,8 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
       clearTimeout(W.dog);
       revokeUrl();
     }
+    // 主が共有の表につなげなかった：手伝いをやめて、主1つで読む（主はつないでいないので今までどおり動く）
+    if (d && d.type === 'smp-error') { W.smpBroken = true; killHelpers(); W.smp = null; return; }
     if (!d || typeof d !== 'object' || d.id !== S.searchId || !S.thinking) return;
     if (d.type === 'info') onInfo(d);
     else if (d.type === 'bestmove') onBest(d.id, d);
@@ -44022,6 +45290,7 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     if (w !== W.w) return;
     if (e && typeof e.preventDefault === 'function') e.preventDefault();
     if (!W.everSpoke) W.broken = true;   // 最初の返事の前に落ちた → この環境では Worker を使わない
+    if (W.smp) W.smpBroken = true;       // 並列で読んでいて主が落ちた → 次からは Worker 1つで読む
     killWorker();
     if (!S.thinking) return;
     if (S.mainTried !== S.searchId) runOnMain(S.req);
@@ -44096,8 +45365,17 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
   function stopThinking() {
     if (!S.thinking) return false;
     S.thinking = false;
+    const old = S.searchId;
     S.searchId++;
     clearTimeout(S.applyTimer);
+    // 並列の読みの間は、Worker を作り直さずに「止めて」の合図（共有の欄）だけ送る。
+    // 作り直すと全員が重い部品を読み直すため。古い番号の返事は捨てる（onWorkerMessage）
+    if (W.smp && W.w && W.everSpoke && S.mainTried !== old) {
+      try {
+        Search.SMP.abort(W.smp.ctl, old);
+        return true;
+      } catch (e) { /* 合図を送れなければ作り直す */ }
+    }
     killWorker();
     ensureWorker();   // 次に備えて作り直す
     return true;
@@ -44752,7 +46030,9 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
 /* アプリ化（設計 §14）：service worker を登録する。公開用の index.html にだけ入る（tools/build_pwa.js が足す）。
  * https か localhost のときだけ登録する。登録できなくても、ページはそのまま遊べる。
  * 公開を更新すると、開いたとき（と、1時間以上たって画面に戻ったとき）に新しい版を裏で取り込み、
- * 入れ替わったら1回だけ読み直す（対局は保存してあるので続きから。初めての登録では読み直さない）。 */
+ * 入れ替わったら1回だけ読み直す（対局は保存してあるので続きから）。
+ * 初めての登録では、sw.js が受け持ったときにページがクロスオリジン分離されていなければ（並列の読みのため。設計 §15）
+ * 1回だけ読み直す。前に一度試したこと（localStorage の shogi-ai-coi）があれば読み直さない（分離できないブラウザで繰り返さない）。 */
 (function () {
   'use strict';
   try {
@@ -44765,7 +46045,14 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     var hadController = !!sw.controller;
     var reloading = false;
     sw.addEventListener('controllerchange', function () {
-      if (!hadController || reloading) return;
+      if (reloading) return;
+      if (!hadController) {
+        if (window.crossOriginIsolated !== false) return;
+        try {
+          if (window.localStorage.getItem('shogi-ai-coi')) return;
+          window.localStorage.setItem('shogi-ai-coi', String(Date.now()));
+        } catch (e) { return; }
+      }
       reloading = true;
       loc.reload();
     });
