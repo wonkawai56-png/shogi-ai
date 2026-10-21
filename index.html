@@ -1138,6 +1138,401 @@ select {
 :root.is-standalone body::before { content: ""; position: fixed; z-index: 60; top: 0; left: 0; right: 0; height: var(--safe-t); background: var(--band); pointer-events: none; }
 :root.is-standalone, :root.is-standalone body { overscroll-behavior-y: none; }
 
+/* ---------- 保存した棋譜（設計 §16） ----------
+ * 一覧（#dlg-saved）・見返し（#dlg-review）・削除の確認（#dlg-del）。どれもページ内のダイアログ。
+ * 見返しの盤と駒台は、対局の盤と同じ部品（.board-block・.stand・.kaya・.grid・.sq・.pc）を使い、大きさの決め方も同じ：
+ *   スマホの縦向き：盤のマス以外の高さの合計（--v-fixed）を見返しの画面の並びで置き直す（下の「縦向き」の節）。
+ *   横向きのスマホ：対局と同じ並び（駒台｜盤｜駒台＋右に欄）なので、対局の --v-fixed・--cell-wl をそのまま使う。
+ *   広い画面：ページの中央に大きく開き、盤のマスはダイアログの幅と高さから決める。
+ * 見返しの画面だけの高さはここの変数で決める（tests/pwa.test.js が同じ値から計算して確かめる）。 */
+:root {
+  --rv-head-h: 44px;    /* 見返しの題と「閉じる」の段 */
+  --rv-gap: 8px;        /* 盤（自分の駒台）と手の位置の行の間 */
+  --rv-pos-h: 24px;     /* 手の位置の行（「12手目　▲７六歩」） */
+  --rv-step-gap: 8px;   /* 手の位置の行と進め戻しのボタンの間（進め戻しと形勢のグラフの段の間も同じ） */
+  --rv-btn-h: 44px;     /* 最初・戻る・進む・最後 */
+  --rv-an-h: 48px;      /* 形勢のグラフと「分析」の段（設計 §17） */
+}
+
+/* 終局の札の「保存した棋譜に入れました」 */
+.over-saved { margin: 0; font-size: 13px; color: var(--ink-3); }
+.over-saved:empty { display: none; }
+
+/* 押せない状態（焦点を失わないよう disabled の代わりに aria-disabled を使うボタン） */
+.btn[aria-disabled="true"] { opacity: 0.42; cursor: default; }
+.btn-del { color: var(--shu-ink); }
+
+/* ---- 一覧 ---- */
+.dlg-saved { overflow: hidden; }
+.saved-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: calc(var(--vh) - 34px - var(--safe-t) - var(--safe-b));
+  padding: 16px 20px 16px;
+}
+.saved-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.saved-head .btn { flex: none; min-width: 5.5em; }
+.saved-info { margin: 0; font-size: 12.5px; color: var(--ink-2); }
+.saved-info.is-warn { color: var(--shu-ink); }
+.saved-body .dlg-note:empty { display: none; }
+.saved-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-top: 1px solid var(--rule-strong);
+}
+.saved-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--rule);
+}
+.saved-open {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 64px;
+  margin: 0;
+  padding: 6px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  text-align: left;
+}
+@media (hover: hover) {
+  .saved-open:hover { background: var(--sel-row); }
+}
+.saved-badge {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border: 2px solid var(--ink-3);
+  border-radius: 4px;
+  color: var(--ink-2);
+  font: 800 19px/1 var(--mincho);
+  transform: rotate(-4deg);
+}
+.saved-badge.is-win { border-color: var(--shu); color: var(--shu-ink); }
+.saved-text { display: grid; min-width: 0; line-height: 1.4; }
+.saved-date { font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; }
+.saved-sub { font-size: 12.5px; color: var(--ink-2); overflow-wrap: anywhere; }
+.saved-acts { display: grid; gap: 0; }
+.saved-acts .btn-quiet { min-height: 40px; padding: 0 6px; }
+.saved-acts .saved-del { color: var(--shu-ink); }
+.saved-empty { padding: 16px 4px; font-size: 14px; color: var(--ink-2); }
+
+/* ---- 見返し ---- */
+.dlg-review { padding: 0; }
+.rv {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+}
+.rv-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.rv-title { margin: 0; font: 700 18px/1.3 var(--mincho); letter-spacing: 0.04em; white-space: nowrap; }
+.rv-close { flex: none; min-width: 5.5em; }
+.rv-board .grid .sq { cursor: default; }
+.rv-side { display: grid; gap: var(--rv-step-gap); align-content: start; min-width: 0; }
+.rv-pos {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  min-height: var(--rv-pos-h);
+  font-size: 15px;
+  line-height: 1.35;
+}
+.rv-pos-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 700 16px/1.35 var(--mincho); }
+/* その局面の点数（あなたから見た値）と、その手の印（分析したときだけ） */
+.rv-pos-an { flex: none; font-size: 12.5px; font-weight: 700; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rv-pos-an:empty { display: none; }
+.rv-pos-an.is-bad, .rv-pos-an.is-blunder { color: var(--shu-ink); }
+.rv-pos-an.is-trap { padding: 1px 6px; border-radius: 3px; background: var(--shu); color: var(--on-shu); }
+.rv-count { flex: none; font-size: 12.5px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.rv-steps { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.rv-steps .btn { height: var(--rv-btn-h); min-height: var(--rv-btn-h); padding: 0 6px; white-space: nowrap; }
+.rv-more { display: grid; gap: 12px; align-content: start; min-width: 0; }
+.rv-meta { margin: 0; font-size: 13px; color: var(--ink-2); }
+.rv-kifu { min-width: 0; }
+.rv-moves {
+  position: relative;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 15rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--sheet);
+  border-top: 1px solid var(--rule-strong);
+  border-bottom: 1px solid var(--rule-strong);
+}
+.rv-moves li { border-bottom: 1px solid var(--rule); }
+.rv-moves li:last-child { border-bottom: 0; }
+.rv-mv, .rv-line {
+  display: grid;
+  grid-template-columns: 3.4em 1.4em minmax(0, 1fr);
+  align-items: center;
+  width: 100%;
+  min-height: 32px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  text-align: left;
+  font-family: var(--mincho);
+  font-size: 15px;
+}
+.rv-mv .k-no, .rv-line .k-no {
+  align-self: stretch;
+  display: grid;
+  align-items: center;
+  justify-content: end;
+  padding-right: 0.9em;
+  border-right: 1px solid var(--rule);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+.rv-mv .k-mk, .rv-line .k-mk { text-align: center; padding-left: 0.4em; font-size: 12px; color: var(--ink-2); }
+.rv-mv .k-mv, .rv-line .k-mv { padding-left: 0.2em; }
+.rv-mv.is-cur { background: var(--kifu-last); font-weight: 700; }
+.rv-mv:focus-visible { outline-offset: -3px; }
+@media (hover: hover) {
+  .rv-mv:hover { background: var(--sel-row); }
+}
+.rv-line.k-end { grid-template-columns: 3.4em minmax(0, 1fr); color: var(--shu-ink); font-size: 14px; }
+.rv-line.k-end .k-mv { padding-left: 0.8em; }
+.rv-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.rv-actions .btn { flex: 1 1 auto; }
+
+/* ---- 見返しの分析（設計 §17） ----
+ * 進め戻しの下の1段（--rv-an-h）に、形勢のグラフ（押すとその局面へ）と「分析」（分析中は「止める」）。
+ * グラフは上があなた有利・下が AI 有利、詰みは上下の端。悪手は白抜きの丸、大悪手は塗った丸、詰み筋に入った手は菱形、
+ * 勝負を分けた手には点線の輪（色だけに頼らない）。説明・この局面の判定・まとめは、その下（スクロール）。 */
+.rv-an { display: flex; align-items: center; gap: 8px; height: var(--rv-an-h); min-width: 0; }
+.rv-an[hidden], .rv-an-detail[hidden] { display: none; }
+.rv-graph {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  border: 1px solid var(--rule-strong);
+  border-radius: 4px;
+  background: var(--sheet);
+  cursor: pointer;
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
+  overflow: hidden;
+}
+.rv-svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.g-mid { stroke: var(--rule-strong); stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+.g-area { fill: var(--ai); fill-opacity: 0.14; stroke: none; }
+.g-line { fill: none; stroke: var(--ai); stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.g-cur { stroke: var(--shu); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.g-bad { fill: var(--sheet); stroke: var(--shu); stroke-width: 1.5; }
+.g-blunder { fill: var(--shu); stroke: var(--sheet); stroke-width: 1; }
+.g-trap { fill: var(--shu); stroke: var(--ink); stroke-width: 1; }
+.g-key { fill: none; stroke: var(--ink); stroke-width: 1.2; stroke-dasharray: 2 2; }
+.g-lab { font-family: var(--sans); font-size: 9px; fill: var(--ink-3); }
+.rv-graph-msg {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  padding: 0 6px;
+  font-size: 12.5px;
+  color: var(--ink-3);
+  text-align: center;
+  pointer-events: none;
+}
+.rv-graph-msg:empty { display: none; }
+.rv-graph-msg.is-corner { inset: 2px auto auto 3px; display: block; padding: 0 4px; border-radius: 3px; background: var(--sheet); font-size: 11px; line-height: 1.4; }
+.rv-an-btn { flex: none; min-width: 5.6em; height: min(44px, var(--rv-an-h)); min-height: 0; padding: 0 10px; white-space: nowrap; }
+.rv-an-btn.is-run { border-color: var(--shu); color: var(--shu-ink); }
+
+.rv-an-detail { display: grid; gap: 8px; min-width: 0; }
+.rv-an-detail .kifu-head { margin: 0; }
+.rv-an-status { margin: 0; font-size: 13px; color: var(--ink-2); }
+.rv-an-status:empty { display: none; }
+.rv-an-here, .rv-an-sum { display: grid; gap: 6px; min-width: 0; }
+.rv-an-here:empty, .rv-an-sum:empty { display: none; }
+.an-line { margin: 0; display: grid; grid-template-columns: 6.6em minmax(0, 1fr); gap: 8px; align-items: baseline; font-size: 14px; line-height: 1.5; }
+.an-line.no-key { display: block; }
+.an-key { font-size: 12px; font-weight: 700; color: var(--ink-3); letter-spacing: 0.04em; }
+.an-val { min-width: 0; overflow-wrap: anywhere; font-family: var(--mincho); }
+.an-line.is-bad .an-val, .an-line.is-blunder .an-val, .an-line.is-trap .an-val { color: var(--shu-ink); font-weight: 700; }
+.an-line.an-trap { padding: 8px 10px; border-left: 3px solid var(--shu); background: var(--sel-row); font-size: 13.5px; }
+.an-line.an-trap .an-val { color: var(--ink); font-family: var(--sans); }
+.an-line.an-sub .an-val { color: var(--ink-3); font-family: var(--sans); font-size: 12.5px; }
+.an-sum-head { margin: 4px 0 0; padding-top: 8px; border-top: 1px solid var(--rule); font-size: 12px; font-weight: 700; letter-spacing: 0.2em; color: var(--ink-3); }
+.an-marks { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; max-height: 13rem; overflow-y: auto; overscroll-behavior: contain; }
+.an-jump {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
+  min-height: 40px;
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--btn-edge);
+  border-radius: 4px;
+  background: var(--btn-bg);
+  color: var(--ink);
+  text-align: left;
+  font-size: 14px;
+  line-height: 1.35;
+}
+.an-jump-mv { font-family: var(--mincho); font-weight: 700; }
+.an-jump-tag { font-size: 12px; font-weight: 700; color: var(--shu-ink); }
+.an-foot { margin: 0; font-size: 12px; line-height: 1.55; color: var(--ink-3); }
+/* 指し手の一覧の印 */
+.rv-mv { grid-template-columns: 3.4em 1.4em minmax(0, 1fr) auto; }
+.rv-mv .k-an { padding: 0 8px; font-family: var(--sans); font-size: 11.5px; font-weight: 700; color: var(--shu-ink); white-space: nowrap; }
+.rv-mv .k-an:empty { display: none; }
+.rv-mv.is-trap .k-an { margin-right: 6px; padding: 1px 6px; border-radius: 3px; background: var(--shu); color: var(--on-shu); }
+
+/* 画面いっぱいに開く（スマホの縦向き・横向き。900px 未満と、高さ 500px 以下の横向き）
+ * 上の時刻表示の分（safe-area の上）は枠の上の線として藍の帯（--band）にする（ホーム画面から開いたときだけ高さがある）。
+ * 中身（.rv）が縦に動く。 */
+@media (max-width: 899px), (orientation: landscape) and (max-height: 500px) {
+  .dlg-review {
+    inset: 0;
+    margin: 0;
+    width: 100%;
+    max-width: none;
+    height: var(--app-h);
+    max-height: none;
+    border: 0;
+    border-top: var(--safe-t) solid var(--band);
+    border-radius: 0;
+    background: var(--page);
+    box-shadow: none;
+    overflow: hidden;
+  }
+  .rv {
+    height: 100%;
+    overflow-x: hidden;   /* 横スクロールは出さない（盤の幅は計算で収めてある） */
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-top: var(--top-pad);
+    padding-inline: max(var(--gut), var(--safe-l)) max(var(--gut), var(--safe-r));
+    padding-bottom: max(24px, var(--safe-b));
+  }
+}
+
+/* スマホの縦向き：上から 題と「閉じる」→ 相手の駒台 → 盤 → 自分の駒台 → 手の位置 → 最初・戻る・進む・最後 →
+ * 形勢のグラフと「分析」 がスクロールなしで1画面に入る（対局の画面と同じ式。--v-fixed を見返しの並びで置き直す）。
+ * 見返しの盤のマスは押さない（ボタンではない）ので、低い画面では対局の盤（26px まで）より小さく 22px まで縮めてよい。
+ * 分析の説明・指し手の一覧などはその下。 */
+@media (max-width: 899px) and (orientation: portrait), (max-width: 899px) and (min-height: 501px) {
+  .rv {
+    /* 盤のマスが下限（22px）でも1画面に入らない低い画面（iPhone SE 初代をホーム画面から開いたときなど）では、
+     * 形勢のグラフの段（--rv-an-h）を 36px まで縮める。引いている値は下の .rv .board-block の --v-fixed から --rv-an-h を除いた物
+     * （16px・5px は縦向きの .board-block の --files-h・--pad。ここでは .board-block の変数が見えないので数で書く）。
+     * 22px × 9.81 は、マス 22px のときの盤の9段の高さ。 */
+    --rv-an-h: clamp(36px, calc(var(--app-h) - (var(--safe-t) + var(--top-pad) + var(--rv-head-h)
+      + 2 * var(--bb-gap) + 2 * var(--stand-h)
+      + 16px + 2 * 5px + 4px + var(--kaya-mb)
+      + var(--rv-gap) + var(--rv-pos-h) + var(--rv-step-gap) + var(--rv-btn-h) + var(--rv-step-gap)
+      + var(--foot-room) + var(--safe-b)) - 22px * 9.81), 48px);
+  }
+  .rv-head { height: var(--rv-head-h); }
+  .rv-title { font-size: 17px; }
+  .rv-close { height: 40px; min-height: 40px; }
+  .rv .board-block {
+    --v-fixed: calc(var(--safe-t) + var(--top-pad) + var(--rv-head-h)
+      + 2 * var(--bb-gap) + 2 * var(--stand-h)
+      + var(--files-h) + 2 * var(--pad) + 4px + var(--kaya-mb)
+      + var(--rv-gap) + var(--rv-pos-h) + var(--rv-step-gap) + var(--rv-btn-h) + var(--rv-step-gap) + var(--rv-an-h)
+      + var(--foot-room) + var(--safe-b));
+    --cell-b: min(60px, var(--cell-w), max(22px, var(--cell-fit)));
+  }
+  .rv-side { margin-top: var(--rv-gap); }
+  .rv-pos { height: var(--rv-pos-h); }
+  .rv-steps { grid-template-columns: 1fr 1.3fr 1.3fr 1fr; }
+  .rv-steps .btn { padding: 0 8px; }
+  .rv-more { margin-top: 6px; }
+}
+
+/* 手の位置の行（設計 §17）：指し手の字（「116手目　△４七銀不成」）が、その局面の点数・印と手数に押されて切れないようにする。
+ * 幅 420px 未満の縦向き：点数・印が出ている間は手数（「116／163手」）を隠し、間を詰める（手数はグラフの読み上げにもある）。
+ * 横向きのスマホと広い画面：右の欄が狭い（190〜360px）ので、2段にする（1段目に指し手、2段目に点数・印と手数）。 */
+@media (max-width: 419px) {
+  .rv-pos { gap: 6px; }
+  .rv-pos-an:not(:empty) + .rv-count { display: none; }
+}
+@media (min-width: 900px), (orientation: landscape) and (max-height: 500px) {
+  :root { --rv-pos-h: 42px; }
+  .rv-pos { flex-wrap: wrap; align-content: center; column-gap: 8px; row-gap: 0; }
+  .rv-pos-text { flex-basis: 100%; }
+  .rv-count { margin-left: auto; }
+}
+
+/* 横向きのスマホ：左に盤（駒台｜盤｜駒台）、右の欄に 題と「閉じる」→ 手の位置 → 進め戻し（2段）→ 形勢のグラフと「分析」
+ * →（その下は欄の中で動く） */
+@media (orientation: landscape) and (max-height: 500px) {
+  :root { --rv-head-h: 40px; --rv-btn-h: 40px; --rv-an-h: 44px; }
+  .rv-an { flex: none; }
+  .rv {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    column-gap: 10px;
+    row-gap: 6px;
+    padding-bottom: calc(var(--land-room) + var(--safe-b));
+  }
+  .rv-head { grid-column: 2; grid-row: 1; height: var(--rv-head-h); }
+  .rv-title { font-size: 16px; }
+  .rv-close { height: 36px; min-height: 36px; }
+  .rv .board-block { grid-column: 1; grid-row: 1 / span 2; }
+  .rv-side { grid-column: 2; grid-row: 2; display: flex; flex-direction: column; gap: 6px; min-height: 0; }
+  .rv-pos { flex: none; height: var(--rv-pos-h); }
+  .rv-steps { flex: none; }
+  .rv-steps .btn { font-size: 13.5px; }
+  .rv-more { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+  .rv-moves { max-height: none; }
+}
+
+/* 広い画面：ページの中央に大きく開く（題の段の下に、左に盤・右に手の位置と進め戻しと指し手） */
+@media (min-width: 900px) and (min-height: 501px) {
+  :root { --rv-an-h: 96px; }
+  .dlg-review { width: min(1240px, calc(100vw - 32px)); }
+  .rv {
+    grid-template-columns: auto minmax(280px, 360px);
+    column-gap: 28px;
+    row-gap: 12px;
+    align-items: start;
+    padding: 16px 22px 20px;
+  }
+  .rv-head { grid-column: 1 / -1; }
+  .rv .board-block {
+    grid-column: 1;
+    grid-row: 2;
+    --cell: clamp(30px, min(calc((var(--vh) - 190px) / 10.5), calc((min(100vw, 1240px) - 500px) / 12.6)), 60px);
+  }
+  .rv-side { grid-column: 2; grid-row: 2; }
+  .rv-moves { max-height: clamp(160px, calc(var(--vh) - 470px), 480px); }
+}
+
 /* ---------- 動きを減らす ---------- */
 
 @media (prefers-reduced-motion: reduce) {
@@ -1220,6 +1615,7 @@ select {
         <div class="ctl-sub">
           <button type="button" class="btn-quiet" id="btn-flip">盤を反転</button>
           <button type="button" class="btn-quiet" id="btn-copy">棋譜をコピー</button>
+          <button type="button" class="btn-quiet" id="btn-saved">保存した棋譜</button>
           <button type="button" class="toggle" id="btn-sound" aria-pressed="true"><span class="toggle-name">音</span><span class="toggle-state" id="sound-state">オン</span></button>
           <button type="button" class="toggle" id="btn-pv" aria-pressed="false"><span class="toggle-name">AIの読みを表示</span><span class="toggle-state" id="pv-state">オフ</span></button>
         </div>
@@ -1292,6 +1688,7 @@ select {
       </div>
     </div>
     <p class="over-text" id="over-text"></p>
+    <p class="over-saved" id="over-saved" aria-live="polite"></p>
     <p class="dlg-note" id="over-note" role="status" aria-live="polite"></p>
     <div class="dlg-actions dlg-actions-wrap">
       <button type="button" class="btn-quiet" id="btn-over-close">盤を見る（閉じる）</button>
@@ -1310,6 +1707,115 @@ select {
     <div class="dlg-actions">
       <button type="button" class="btn" id="btn-kif-select">全部を選択</button>
       <button type="button" class="btn btn-primary" id="btn-kif-close">閉じる</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog class="dlg dlg-saved" id="dlg-saved" aria-labelledby="dlg-saved-title">
+  <div class="saved-body">
+    <div class="saved-head">
+      <h2 class="dlg-title" id="dlg-saved-title">保存した棋譜</h2>
+      <button type="button" class="btn" id="btn-saved-close">閉じる</button>
+    </div>
+    <p class="saved-info" id="saved-info"></p>
+    <p class="saved-info is-warn" id="saved-trouble" hidden>今回は保存の場所をうまく開けませんでした。前の棋譜は消えていません。ページを開き直すと見えます。</p>
+    <p class="dlg-note" id="saved-note" role="status" aria-live="polite"></p>
+    <ol class="saved-list" id="saved-list" aria-labelledby="dlg-saved-title"></ol>
+  </div>
+</dialog>
+
+<dialog class="dlg dlg-review" id="dlg-review" aria-labelledby="rv-title">
+  <div class="rv" id="rv">
+    <div class="rv-head">
+      <h2 class="rv-title" id="rv-title">棋譜を見返す</h2>
+      <button type="button" class="btn rv-close" id="btn-rv-close">閉じる</button>
+    </div>
+
+    <section class="board-block rv-board" aria-label="見返している局面">
+      <div class="stand stand-top">
+        <p class="plate" id="rv-plate-top"></p>
+        <div class="komadai" id="rv-hand-top"></div>
+      </div>
+      <div class="board-frame">
+        <div class="files" id="rv-files" aria-hidden="true"></div>
+        <div class="kaya">
+          <div class="grid" id="rv-board" role="group" aria-label="見返している盤"></div>
+          <span class="star" style="--x:1;--y:1" aria-hidden="true"></span>
+          <span class="star" style="--x:2;--y:1" aria-hidden="true"></span>
+          <span class="star" style="--x:1;--y:2" aria-hidden="true"></span>
+          <span class="star" style="--x:2;--y:2" aria-hidden="true"></span>
+        </div>
+        <div class="ranks" id="rv-ranks" aria-hidden="true"></div>
+      </div>
+      <div class="stand stand-bottom">
+        <div class="komadai" id="rv-hand-bottom"></div>
+        <p class="plate" id="rv-plate-bottom"></p>
+      </div>
+    </section>
+
+    <div class="rv-side">
+      <p class="rv-pos" id="rv-pos" aria-live="polite"><span class="rv-pos-text" id="rv-pos-text"></span><span class="rv-pos-an" id="rv-pos-an"></span><span class="rv-count" id="rv-count"></span></p>
+      <div class="rv-steps" role="group" aria-label="進め戻し（キーボードの左右でも動かせます）">
+        <button type="button" class="btn" id="btn-rv-first" aria-label="最初の局面へ">最初</button>
+        <button type="button" class="btn" id="btn-rv-prev" aria-label="1手戻る">&#x25C0;&#xFE0E; 戻る</button>
+        <button type="button" class="btn btn-primary" id="btn-rv-next" aria-label="1手進む">進む &#x25B6;&#xFE0E;</button>
+        <button type="button" class="btn" id="btn-rv-last" aria-label="最後の局面へ">最後</button>
+      </div>
+      <div class="rv-an" id="rv-an">
+        <div class="rv-graph" id="rv-graph" role="slider" tabindex="0" aria-label="形勢のグラフ（上があなた有利。押すとその局面へ。左右の矢印でも動かせます）" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" aria-valuetext="開始局面">
+          <p class="rv-graph-msg" id="rv-graph-msg" aria-hidden="true">まだ分析していません</p>
+        </div>
+        <button type="button" class="btn rv-an-btn" id="btn-rv-an">分析</button>
+      </div>
+      <div class="rv-more">
+        <section class="rv-an-detail" id="rv-an-detail" aria-labelledby="rv-an-title">
+          <h3 class="kifu-head" id="rv-an-title">分析</h3>
+          <p class="rv-an-status" id="rv-an-status"></p>
+          <p class="sr-only" id="rv-an-live" role="status" aria-live="polite"></p>
+          <div class="rv-an-here" id="rv-an-here"></div>
+          <div class="rv-an-sum" id="rv-an-sum"></div>
+        </section>
+        <p class="rv-meta" id="rv-meta"></p>
+        <section class="rv-kifu" aria-labelledby="rv-kifu-title">
+          <h3 class="kifu-head" id="rv-kifu-title">指し手（押すとその局面へ）</h3>
+          <ol class="rv-moves" id="rv-moves" aria-labelledby="rv-kifu-title"></ol>
+        </section>
+        <div class="rv-actions">
+          <button type="button" class="btn" id="btn-rv-copy">棋譜をコピー</button>
+          <button type="button" class="btn" id="btn-rv-flip">盤を反転</button>
+          <button type="button" class="btn" id="btn-rv-list">一覧へ戻る</button>
+          <button type="button" class="btn btn-del" id="btn-rv-delete">削除</button>
+        </div>
+        <p class="dlg-note" id="rv-note" role="status" aria-live="polite"></p>
+      </div>
+    </div>
+  </div>
+</dialog>
+
+<dialog class="dlg dlg-small" id="dlg-an" aria-labelledby="dlg-an-title">
+  <form class="dlg-body" id="form-an" method="dialog">
+    <h2 class="dlg-title" id="dlg-an-title">この対局を分析する</h2>
+    <p class="dlg-text">AI が1局面ずつ読み直して、形勢のグラフと、点数が大きく落ちた手（悪手）、自分の玉が詰む筋に入った手を調べます。分析の間も進め戻しができ、途中で止められます。</p>
+    <fieldset class="field">
+      <legend class="field-key">1局面に読む時間</legend>
+      <div class="levels" id="an-speeds"></div>
+    </fieldset>
+    <p class="field-note" id="an-note"></p>
+    <div class="dlg-actions">
+      <button type="button" class="btn" id="btn-an-cancel">やめる</button>
+      <button type="submit" class="btn btn-primary" id="btn-an-start">始める</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog class="dlg dlg-small" id="dlg-del" aria-labelledby="dlg-del-title">
+  <div class="dlg-body">
+    <h2 class="dlg-title" id="dlg-del-title">この棋譜を削除しますか？</h2>
+    <p class="dlg-text" id="del-text"></p>
+    <p class="dlg-warn">削除すると元に戻せません。</p>
+    <div class="dlg-actions">
+      <button type="button" class="btn" id="btn-del-no">やめる</button>
+      <button type="button" class="btn btn-danger" id="btn-del-yes">削除する</button>
     </div>
   </div>
 </dialog>
@@ -2437,6 +2943,7 @@ select {
  * 反復深化・PVS・置換表・null move・ProbCut・singular extension・LMR（履歴で調整）・LMP・futility・SEE による枝刈り・
  * 静止探索・1手詰め・王手延長・続きの履歴。外部の評価データは使わない（評価は setEvaluator で差し替えられる）。
  * 並列の読み（共有の置換表を持つ複数の Worker が同じ局面を読む。ShogiSearch.SMP。設計 §15）。
+ * 相手の詰みの見張り（根で選ぼうとしている手を指したあと、相手に王手の連続の詰みがあれば、その手を外す。設計 §8 の「見張り」）。
  * 変更ごとの比べ方と数字は docs/読みの改良.md。 */
 (function (root, factory) {
   const api = factory(root);
@@ -2680,6 +3187,77 @@ select {
   let rootMoves = new Int32Array(MAXM), rootScores = new Int32Array(MAXM), rootN = 0, fullRoot = false, guardMate1 = false;
   // 時間切れで途中までになった深さでも、前の最善手より良いと読み切れた手（とその読み筋）
   let partialMove = 0, partialScore = 0, partialPv = [];
+
+  // ===== 相手の詰みの見張り（2026-10-21）=====
+  // 根で「この深さでいちばん良さそうな手」（先頭の手か、alpha を超えた手）を指したあとの局面で、相手が王手の連続で
+  // 詰ませられるかを詰み探索（つなぎ口 b。engine/mate.js の solvePosition）で調べる。詰まされるなら、その手の点を
+  // 「1＋詰みの手数で詰まされる」値に替える（反復深化がそのまま次に良い手を選ぶ。全部の手が詰まされるなら、見張りが無ければ指していた手）。
+  // 調べた結果は手ごとに覚え、同じ search の中では同じ手を2回調べない。予算は持ち時間（局面数で区切るときは局面数）の guardShare。
+  // 作者が v4 の最強に勝った棋譜（docs/棋譜/2026-10-21_分析.md）の 116手目のように、読みの深さでは届かない長い詰みを見落とすのを防ぐ。
+  let gOn = false, gTimed = true, gMinDepth = 4;
+  let gLeftMs = 0, gPerMs = 0, gLeftNodes = 0, gPerNodes = 0, gExtraMs = 0;
+  // gMap：手 → 結果（>0 詰まされる手数・0 詰まされない・−1 分からない／調べなかった）
+  // gOver：見張りが外した手（点を詰まされる値に替えた手）→ 外したときの読みの点（どの手も詰まされるとき、見張りが無ければ指していた手を選ぶため）
+  let gMap = null, gOver = null;
+  const GUARD_LONG = 11;   // どの手も詰まされるとき、これ以上の手数の詰みは「相手が見つけにくい」とみなす（下の「どの手も詰まされる」）
+  let gChecks = 0, gMated = 0, gNodes = 0, gMs = 0;
+  // 読みの途中の詰み探索（tune.dmate。既定はしない）に使う物と、その回数（確かめ用）
+  let dmSolver = null, dmCalls = 0, dmHits = 0, dmNodes = 0;
+  // 手 m を指したあとの局面 p（相手の番）で、相手が王手の連続で詰ませられるか。返り値は gMap の値と同じ。
+  // over：根の読みが終わったあと（並列の手伝いの手を確かめるとき）。持ち時間の上限ではなく、持ち時間の 5% までなら超えてよい
+  function guardCheck(p, m, over) {
+    const c = gMap.get(m);
+    if (c !== undefined) return c;
+    const ms = getMate();
+    let nb = Math.min(gPerNodes, gLeftNodes), tb = 0;
+    if (gTimed) {
+      tb = Math.min(gPerMs, gLeftMs, over ? gExtraMs : hardLimit - now());
+      if (tb < 5) nb = 0;
+    }
+    if (!(nb >= 200) || !ms) { gMap.set(m, -1); return -1; }
+    const t0 = now();
+    let r = null;
+    try { r = ms.solvePosition(p, { maxNodes: nb, timeMs: gTimed ? tb : undefined, pv: false }); } catch (e) { r = null; }
+    const el = now() - t0;
+    gLeftMs -= el; gMs += el; gChecks++;
+    if (over) gExtraMs -= el;
+    const used = r && r.nodes > 0 ? r.nodes : 0;
+    gLeftNodes -= used; gNodes += used;
+    const v = r && r.result === 'mate' ? Math.max(1, r.length | 0) : r && r.result === 'nomate' ? 0 : -1;
+    if (v > 0) gMated++;
+    gMap.set(m, v);
+    return v;
+  }
+  // 読みが終わったあと（指す手を決める直前）に、手 m がまだ調べられていないか「分からない」なら、残りの予算で調べる。
+  // 持ち時間の上限ではなく、持ち時間の 5% までなら超えてよい（over）。返り値は gMap の値と同じ
+  function guardFinal(p, m) {
+    const st = gMap.get(m);
+    if (st !== undefined && st !== -1) return st;
+    gMap.delete(m);
+    const sMs = gPerMs, sN = gPerNodes;
+    gPerMs = gLeftMs; gPerNodes = gTimed ? gPerNodes : gLeftNodes;
+    p.makeMove(m);
+    const len = guardCheck(p, m, true);
+    p.unmakeMove(m);
+    gPerMs = sMs; gPerNodes = sN;
+    return len;
+  }
+  // 読みを終える前に、指そうとしている手 m の見張りが「分からない」（1回の予算が尽きた）なら、残りの予算を全部使ってもう一度調べる
+  // （詰み探索の置換表に前の続きが残っているので、続きから読める）。詰まされると分かったら true（読みを続けて、次に良い手を選ぶ）。raw はその手の読みの点
+  function guardRecheck(p, m, raw) {
+    if (!gOn) return false;
+    const st = gMap.get(m);
+    if ((st !== -1 && st !== undefined) || !(gLeftNodes >= 200) || (gTimed && !(gLeftMs >= 5))) return false;
+    gMap.delete(m);
+    const sMs = gPerMs, sN = gPerNodes;
+    gPerMs = gLeftMs; gPerNodes = gTimed ? gPerNodes : gLeftNodes;
+    p.makeMove(m);
+    const len = guardCheck(p, m, false);
+    p.unmakeMove(m);
+    gPerMs = sMs; gPerNodes = sN;
+    if (len > 0) { gOver.set(m, raw); return true; }
+    return false;
+  }
 
   // 置換表を用意する。メモリが足りない環境では小さくして続ける（2^16 欄まで。それより小さい指定はそのまま）
   // 共有の置換表をつないでいる間（並列の読み。下の「並列の読み」の節）は、自分では用意しない。
@@ -2941,9 +3519,12 @@ select {
   // se：singular extension／chk：王手延長（0＝すべての王手、1＝取る手か SEE で損をしない王手だけ、2＝しない）／
   // m1d：1手詰めを調べる最小の深さ／ecache：評価値の覚え書き／lsort：残りの手をまとめて並べ替える／
   // cont：続きの履歴／dropord：打つ手の並べ方／pc：ProbCut／tm：時間の使い方／lmr：LMR の表の割る数／ttbits：置換表の大きさ／
-  // smpskip：並列の読みで、手伝いが読む深さを手伝いごとにずらして間引く（false＝全員がすべての深さを読む）
-  const TUNE_DEFAULT = { se: true, chk: 1, m1d: 3, ecache: true, lsort: true, cont: true, dropord: true, pc: true, tm: true, lmr: 2.2, ttbits: 21, smpskip: true };
+  // smpskip：並列の読みで、手伝いが読む深さを手伝いごとにずらして間引く（false＝全員がすべての深さを読む）／
+  // gdepth：相手の詰みの見張りを始める根の深さ／dmate：読みの途中で、手番側の王手の連続の詰みを詰み探索で調べる最小の残りの深さ（0＝調べない）・
+  // dmn：その1回の予算（局面数）。dmate は 2026-10-21 に試した案（docs/読みの改良.md 第10節）
+  const TUNE_DEFAULT = { se: true, chk: 1, m1d: 3, ecache: true, lsort: true, cont: true, dropord: true, pc: true, tm: true, lmr: 2.2, ttbits: 21, smpskip: true, gdepth: 4, dmate: 0, dmn: 600 };
   let T_se = true, T_chk = 1, T_m1d = 3, T_lsort = true, T_cont = true, T_dropord = true, T_pc = true, T_tm = true, T_ttbits = 21, T_smpskip = true;
+  let T_gdepth = 4, T_dmate = 0, T_dmn = 600;
   function setTune(t) {
     const u = Object.assign({}, TUNE_DEFAULT, t || {});
     T_se = !!u.se; T_chk = u.chk | 0; T_m1d = Number.isInteger(u.m1d) ? u.m1d : 3;
@@ -2951,6 +3532,9 @@ select {
     buildLmr(Number(u.lmr) > 0.5 ? Number(u.lmr) : 2.2);
     T_ttbits = Number.isInteger(u.ttbits) && u.ttbits >= 10 && u.ttbits <= 24 ? u.ttbits : 21;
     T_smpskip = u.smpskip !== false;
+    T_gdepth = Number.isInteger(u.gdepth) && u.gdepth >= 1 ? u.gdepth : 4;
+    T_dmate = Number.isInteger(u.dmate) && u.dmate >= 1 ? u.dmate : 0;
+    T_dmn = Number.isInteger(u.dmn) && u.dmn >= 50 ? u.dmn : 600;
   }
   const excluded = new Int32Array(MAX_PLY + 4);   // singular extension の確かめで外す手
 
@@ -3032,6 +3616,20 @@ select {
         ttStore(ti, key, mm, sc, depth, EXACT, ply);
         pvTab[ply * MAX_PLY] = mm; pvLen[ply] = 1;
         return sc;
+      }
+      // 読みの途中の詰み探索（tune.dmate。既定 0＝しない。2026-10-21 に試した案。docs/読みの改良.md 第10節）：
+      // 残りの深さが dmate 以上なら、手番側に王手の連続の詰みがあるかを dmn 局面まで調べ、詰みならその値を返す。
+      // 使った詰み探索の局面数は nodes に足す（局面数をそろえて比べるため）
+      if (dmSolver !== null && depth >= T_dmate) {
+        const r = dmSolver.solvePosition(p, { maxNodes: T_dmn, pv: false });
+        nodes += r.nodes; dmNodes += r.nodes; dmCalls++;
+        if (r.result === 'mate' && r.move !== 0 && r.length > 0) {
+          dmHits++;
+          const sc = MATE - ply - r.length;
+          ttStore(ti, key, r.move, sc, depth, EXACT, ply);
+          pvTab[ply * MAX_PLY] = r.move; pvLen[ply] = 1;
+          return sc;
+        }
       }
     }
 
@@ -3159,13 +3757,24 @@ select {
       p.makeMove(m);
       const nd = depth - 1 + (gc ? 1 : 0);
       let sc;
-      if (guardMate1 && !gc && p.mateIn1() !== 0) {
+      // 相手の詰みの見張りで、詰まされると分かっている手は読まない（点は「1＋詰みの手数で詰まされる」）
+      const gk = gOn ? gMap.get(m) : undefined;
+      if (gk !== undefined && gk > 0) {
+        sc = -MATE + 1 + gk; pvLen[1] = 0;
+      } else if (guardMate1 && !gc && p.mateIn1() !== 0) {
         sc = -MATE + 2; pvLen[1] = 0;
       } else if (fullRoot) sc = -negamax(nd, -INF, INF, 1, gc, true);
       else if (i === 0) sc = -negamax(nd, -beta, -alpha, 1, gc, true);
       else {
         sc = -negamax(nd, -alpha - 1, -alpha, 1, gc, true);
         if (sc > alpha && sc < beta && !stopFlag) sc = -negamax(nd, -beta, -alpha, 1, gc, true);
+      }
+      // 相手の詰みの見張り：この深さでいちばん良くなりそうな手（先頭の手か、alpha を超えた手）を指したあと、
+      // 相手に王手の連続の詰みがあれば、詰まされる値に替える（読みが詰みを読み切っている手・勝ちの詰みの手は調べない）
+      if (gOn && gk === undefined && !stopFlag && rootDepth >= gMinDepth && sc > best && (i === 0 || sc > alpha)
+        && sc > -MATE_BOUND && sc < MATE_BOUND) {
+        const len = guardCheck(p, m, false);
+        if (len > 0) { gOver.set(m, sc); sc = -MATE + 1 + len; pvLen[1] = 0; }
       }
       p.unmakeMove(m);
       if (stopFlag) break;
@@ -3202,6 +3811,7 @@ select {
   // book：定跡を使う（つなぎ口 a）。mateSearch：詰み探索を先に呼ぶ（つなぎ口 b。持ち時間の mateShare まで）。
   // bookPick：定跡の手の選び方（chooseBook）。'count'＝出現数に比例してばらつく／'good'＝勝率の悪い手を軽くしてばらつく／'best'＝出現数と勝率で一番よい手
   // mateShare：詰み探索に使う持ち時間の割合
+  // mateGuard：相手の詰みの見張り（Lv4〜7。詰み探索を使う段階と同じ。2026-10-21）。guardShare：その予算（持ち時間の割合。1手で全部使うとは限らない）
   // parallel：並列の読み（Lv4〜7）。ページがクロスオリジン分離されていて、手伝いの Worker がつながっているときだけ働く（下の「並列の読み」の節）。
   // learnedEval：学習した評価を使う（Lv3〜7。1手0.5秒の対局 160 局で手書きの評価に 110勝50敗。docs/検証記録.md の v2-2）。
   //   Lv1・2 は覚えたての人向けの段階で、ゆらぎの幅を手書きの評価に合わせてあるので手書きのまま。
@@ -3209,10 +3819,10 @@ select {
     { level: 1, name: '入門', desc: '1手先と駒の取り合いだけ読む。ときどき緩む', maxDepth: 1, timeMs: 3000, noise: 250, blunder: 0.2, resign: false, book: false, mateSearch: false },
     { level: 2, name: '初級', desc: '2手先まで読む。少しゆらぎあり', maxDepth: 2, timeMs: 3000, noise: 120, blunder: 0, resign: false, book: false, mateSearch: false },
     { level: 3, name: '中級', desc: '0.4秒考える。序盤は定跡をいろいろ指す。ほんの少しゆらぎあり', maxDepth: 64, timeMs: 400, noise: 40, blunder: 0, resign: true, book: true, bookPick: 'count', mateSearch: false, learnedEval: true },
-    { level: 4, name: '上級', desc: '1秒まで考える。長い詰みも探す', maxDepth: 64, timeMs: 1000, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'count', mateSearch: true, mateShare: 0.1, learnedEval: true, parallel: true },
-    { level: 5, name: '有段', desc: '2.5秒まで考える。定跡は勝率のよい手を多めに', maxDepth: 64, timeMs: 2500, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'good', mateSearch: true, mateShare: 0.1, learnedEval: true, parallel: true },
-    { level: 6, name: '高段', desc: '5秒まで考える', maxDepth: 64, timeMs: 5000, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'good', mateSearch: true, mateShare: 0.1, learnedEval: true, parallel: true },
-    { level: 7, name: '最強', desc: '10秒まで考える。定跡は勝率のよい手だけ', maxDepth: 64, timeMs: 10000, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'best', mateSearch: true, mateShare: 0.1, learnedEval: true, parallel: true },
+    { level: 4, name: '上級', desc: '1秒まで考える。長い詰みも探す', maxDepth: 64, timeMs: 1000, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'count', mateSearch: true, mateShare: 0.1, mateGuard: true, guardShare: 0.2, learnedEval: true, parallel: true },
+    { level: 5, name: '有段', desc: '2.5秒まで考える。定跡は勝率のよい手を多めに', maxDepth: 64, timeMs: 2500, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'good', mateSearch: true, mateShare: 0.1, mateGuard: true, guardShare: 0.2, learnedEval: true, parallel: true },
+    { level: 6, name: '高段', desc: '5秒まで考える', maxDepth: 64, timeMs: 5000, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'good', mateSearch: true, mateShare: 0.1, mateGuard: true, guardShare: 0.2, learnedEval: true, parallel: true },
+    { level: 7, name: '最強', desc: '10秒まで考える。定跡は勝率のよい手だけ', maxDepth: 64, timeMs: 10000, noise: 0, blunder: 0, resign: true, book: true, bookPick: 'best', mateSearch: true, mateShare: 0.1, mateGuard: true, guardShare: 0.2, learnedEval: true, parallel: true },
   ];
 
   // ===== 定跡・詰み探索のつなぎ口（a・b）=====
@@ -3589,8 +4199,12 @@ select {
     const blunder = lv ? lv.blunder : 0;
     fullRoot = noiseAmp > 0 && maxDepth <= 2;
     guardMate1 = lv ? lv.level === 1 : false;
+    gOn = false;   // 相手の詰みの見張りは、下で使うと決めたときだけ
 
     setTune(o.tune);
+    // 読みの途中の詰み探索（tune.dmate）は、詰み探索を持つ主だけ（手伝いには詰み探索の部品が無い）
+    dmSolver = null; dmCalls = 0; dmHits = 0; dmNodes = 0;
+    if (T_dmate > 0 && !H) { const dm = getMate(); if (dm && typeof dm.solvePosition === 'function') dmSolver = dm; }
     ttAlloc(T_ttbits);
     // 置換表の世代。手伝いは主の世代に合わせる（同じ表を分け合うため）
     ttGen = H ? (H.gen | 0) & 0x1fffff : (ttGen + 1) & 0x1fffff;
@@ -3678,6 +4292,27 @@ select {
         r.mateMs = Math.round(mateMs);
         if (o.onInfo) o.onInfo({ depth: ms.plies, score: r.score, mate: ms.plies, nodes, nps: 0, pv: r.pv, timeMs: r.timeMs });
         return r;
+      }
+    }
+    // 相手の詰みの見張り（上の「相手の詰みの見張り」の節）：段階の設定 mateGuard（Lv4〜7）か、引数の mateGuard で使う。
+    // 予算は持ち時間の guardShare（Lv4〜7 は 20%。渡されなければ 15%）。1回に使うのはその半分まで（読みの終わりの調べ直しは残り全部）。
+    // 局面数で区切るときは局面数の guardShare（詰み探索の局面数）。
+    // 揺らぎのある段階・合法手が1つのとき・手伝いは使わない
+    const wantGuard = o.mateGuard != null ? !!o.mateGuard : !!(lv && lv.mateGuard);
+    if (!H && wantGuard && rootN > 1 && noiseAmp === 0 && !fullRoot) {
+      const gm = getMate();
+      if (gm && typeof gm.solvePosition === 'function') {
+        const share = typeof o.guardShare === 'number' && o.guardShare > 0 ? Math.min(o.guardShare, 0.5) : lv && lv.guardShare ? lv.guardShare : 0.15;
+        gOn = true; gMap = new Map(); gOver = new Map();
+        gChecks = 0; gMated = 0; gNodes = 0; gMs = 0;
+        gMinDepth = T_gdepth;
+        gTimed = hasTm || !hasMn;
+        gLeftMs = gTimed ? timeMs * share : Infinity;
+        gPerMs = gLeftMs * 0.5;
+        gExtraMs = gTimed ? timeMs * 0.05 : Infinity;
+        gLeftNodes = hasMn ? Math.round(mnIn * share) : Infinity;
+        gPerNodes = hasMn ? Math.round(gLeftNodes * 0.5) : 3000000;
+        if (!useMate && typeof gm.nextGeneration === 'function') gm.nextGeneration();
       }
     }
     // 静かな順の初期並び：取る手・成る手を前へ
@@ -3771,14 +4406,18 @@ select {
         prevBest = bestMove; prevScore = bestScore;
         let target = 0.32 * f;
         if (target > 0.8) target = 0.8;
-        if (frac > target) break;
-      } else if (el > softLimit || elN > 0.6) break;
+        // 指す前に、相手の詰みの見張りが分からないままの手なら残りの予算で調べ直す。詰まされると分かったら読みを続ける
+        if (frac > target) { if (guardRecheck(p, bestMove, bestScore)) continue; break; }
+      } else if (el > softLimit || elN > 0.6) { if (guardRecheck(p, bestMove, bestScore)) continue; break; }
     }
     } finally {
       // 並列の読み（主）：手伝いを止め、結果を集める（例外のときも必ず止める）
       if (smpSeq) smpOut = smpFinish(smpSeq);
     }
     if (H) return result(moveToUsi(bestMove), bestScore, bestDepth, []);
+
+    // 本体から「止めて」が来たとき（並列の主。待った・新しい対局など。返す手は捨てられる）は、見張りの最後の確かめをしない
+    if (gOn && abortId !== 0 && shCtl !== null && Atomics.load(shCtl, C_ABORT) >= abortId) gOn = false;
 
     // 並列の読み（主）：いちばん深く読み切った結果を選ぶ。手伝いの手は、この局面の合法手の中にあるものだけ使う
     if (smpOut) {
@@ -3787,13 +4426,68 @@ select {
         let ok = false;
         for (let i = 0; i < rootN; i++) if (rootMoves[i] === h.move) { ok = true; break; }
         if (!ok || !h.pv.length || h.pv[0] !== h.move) continue;
+        // 相手の詰みの見張りで、詰まされると分かった手は使わない（手伝いは見張りをしないので、その手を良いと読んでいることがある）
+        if (gOn && gMap.get(h.move) > 0) continue;
         if (smpBetter(h, cand)) { cand = h; pick = h; }
+      }
+      // 主が調べていない手を選んだときは、ここで調べる（持ち時間の 5% までなら超えてよい）。詰まされるなら主の結果のまま。
+      // 調べ切れなかった（分からない）ときも、主の手が「詰まされない」と分かっていれば主の結果のまま
+      if (pick && gOn && pick.move !== bestMove && pick.score < MATE_BOUND) {
+        const len = guardFinal(p, pick.move);
+        if (len > 0 || (len < 0 && gMap.get(bestMove) === 0)) pick = null;
       }
       if (pick) {
         bestMove = pick.move; bestScore = pick.score; bestDepth = pick.depth;
         bestPv = smpPvUsi(p, pick.pv);
       }
       nodes += smpOut.nodes;   // 結果の局面数は全員の合計
+    }
+
+    // 相手の詰みの見張り（指す前の最後の確かめ）：指す手がまだ調べられていないか「分からない」なら、残りの予算で調べる
+    // （時間切れ・局面数の上限で読みが止まったときは、読みの終わりの調べ直しが行われていないため。持ち時間の 5% までなら超えてよい）。
+    // 詰まされると分かったら、詰まされると分かっていない手（読みでも詰まされると読み切っていない手）のうち、最後に読み切った深さの
+    // 並びでいちばん前の手に替えて、それも同じように調べる（点はその手の読みの値。読み筋はその手だけ）。
+    // 点がすでに詰まされる値なら（どの手も詰まされる）、替えない
+    if (gOn && bestScore > -MATE_BOUND && bestScore < MATE_BOUND) {
+      for (let tries = 0; tries < 8; tries++) {
+        if (!(guardFinal(p, bestMove) > 0)) break;
+        gOver.set(bestMove, bestScore);
+        let next = -1;
+        for (let i = 0; i < rootN; i++) {
+          const m = rootMoves[i];
+          if (m === bestMove || gMap.get(m) > 0 || !(rootScores[i] > -MATE_BOUND)) continue;
+          next = i; break;
+        }
+        if (next < 0) {
+          // ほかの手もすべて詰まされる：点を詰まされる値にする（いちばん長く粘れる手の値。指す手は下の「どの手も詰まされる」で決める）
+          let bv = -INF;
+          for (let i = 0; i < rootN; i++) {
+            const m = rootMoves[i], gl = gMap.get(m);
+            const v = gl > 0 ? -MATE + 1 + gl : rootScores[i];
+            if (v > bv) { bv = v; bestMove = m; }
+          }
+          bestScore = bv; bestPv = [moveToUsi(bestMove)];
+          break;
+        }
+        bestMove = rootMoves[next]; bestScore = rootScores[next] < MATE_BOUND ? rootScores[next] : bestScore; bestPv = [moveToUsi(bestMove)];
+      }
+    }
+
+    // 相手の詰みの見張り：どの手も詰まされる値になったとき（見張りが外した手がある）は、見張りが外した手のうち、
+    // 詰みが 11 手以上の手があればその中で外したときの読みの点がいちばん高い手（見張りが無ければ指していた手に近い。相手が長い詰みを
+    // 見つけなければ、いちばん良い形で続けられる）、なければいちばん長く粘れる手（短い詰みは相手も見つけやすい）を指す。点は詰まされる値のまま
+    if (gOn && gOver.size > 0 && bestScore <= -MATE_BOUND) {
+      let maxLen = 0;
+      for (const m of gOver.keys()) if (gMap.get(m) > maxLen) maxLen = gMap.get(m);
+      const need = Math.min(maxLen, GUARD_LONG);
+      let bm = 0, bv = -INF;
+      for (const [m, v] of gOver) {
+        const len = gMap.get(m);
+        if (len < need) continue;
+        const key = maxLen < GUARD_LONG ? len * 1e6 + v : v;   // 長い詰みが無ければ手数が先、同じ手数なら読みの点
+        if (key > bv) { bv = key; bm = m; }
+      }
+      if (bm !== 0 && bm !== bestMove) { bestMove = bm; bestScore = -MATE + 1 + gMap.get(bm); bestPv = [moveToUsi(bm)]; }
     }
 
     // 弱い段階：ときどき次善手
@@ -3808,7 +4502,15 @@ select {
     const r = result(moveToUsi(bestMove), bestScore, bestDepth, bestPv);
     if (useMate) r.mateMs = Math.round(mateMs);
     if (smpOut) r.threads = nThreads;
-    if (lv && lv.resign && r.mate !== null && r.mate < 0) r.bestmove = 'resign';
+    // 相手の詰みの見張りの記録（調べた回数・詰まされると分かった手の数・使った時間と詰み探索の局面数）
+    if (gOn) r.guard = { checks: gChecks, mated: gMated, ms: Math.round(gMs), nodes: gNodes };
+    if (dmSolver !== null) r.dmate = { calls: dmCalls, hits: dmHits, nodes: dmNodes };
+    // 投了は、読みが詰まされることを読み切ったときだけ。見張りが詰まされる手を見つけた search で「どの手も詰まされる」になったときは
+    // 投了せず、見張りが無ければ指していた手を指す（見張りが見つけるのは読みでは届かない長い詰みで、相手が見つけるとは限らない）
+    const guardOnly = gOn && gOver.size > 0 && r.mate !== null && r.mate < 0;
+    if (guardOnly) r.guardMated = true;
+    if (lv && lv.resign && r.mate !== null && r.mate < 0 && !guardOnly) r.bestmove = 'resign';
+    gOn = false;
     return r;
   }
 
@@ -44002,10 +44704,222 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
   try { root.postMessage({ type: 'ready' }); } catch (e) { /* 何もしない */ }
 })(typeof self !== 'undefined' ? self : globalThis);
 </script>
+<script id="src-analyze-worker" type="text/plain">
+/* 棋譜の分析（見返しの画面の「分析」。設計 §17）→ ShogiAnalyze
+ * ページは core.js＋mate.js＋weights_kp.js＋evalkp_wasm.js＋evalkp.js＋search.js＋analyze_worker.js をこの順に連結した Blob から、
+ * 分析専用の Worker を作る（対局の Worker〔worker.js〕とは別。定跡と並列の読みは使わない）。
+ * Worker が使えないときは、ページの本体でこのファイルを読み、ShogiAnalyze.handle を1つずつ呼ぶ（ui/app.js）。
+ * Node では require('./analyze_worker.js') で同じ関数を使える（学習した評価と詰み探索は初めて使うときに読む）。
+ *
+ * worker → 本体 { type:'ready' }                                                   読み込みが済んだら1回
+ * 本体 → worker { type:'eval', id, startSfen, moves, timeMs }                      moves の後の局面を読む
+ * worker → 本体 { type:'eval', id, n, turn, over, score, mate, best, pv, depth, nodes, timeMs, mateSearch }
+ *   score・mate は先手から見た値（score は歩1枚≒100・詰みは ±(100000 − 手数)。mate は手数で、0 は詰みなし）。
+ *   終局の局面（詰み・千日手など）は読まずに over に終わり方（'checkmate' など）、depth −1。
+ * 本体 → worker { type:'trap', id, startSfen, moves, maxNodes, altNodes, altTotal, prefer }
+ *   moves の最後の手を指したあとの局面で、相手（その局面の手番）に王手の連続の詰みがあるかを調べる。
+ *   詰みがあれば、最後の手の前の局面のほかの合法手それぞれについても調べ、詰まされない手を数える（prefer の手を先に調べる）。
+ *   予算はどれも局面数（時計の時間では切らない＝端末の速さで結果が変わらない）：
+ *     maxNodes：指した手のあとの詰み探索（手順の取り出しと最短の確かめにも、それぞれ同じだけまで）、
+ *     altNodes：ほかの手1つの上限（2段目。1段目はその 1/10）、altTotal：ほかの手の全部に使う上限（0 なら調べない）。
+ * worker → 本体 { type:'trap', id, n, result:'mate'|'nomate'|'unknown'|'skip', length, pv, nodes, timeMs,
+ *                 alt: null | { total, safe, mated, unknown, checked, examples } }
+ *   total は最後の手の前の局面の合法手の数（指した手を含む）。safe・mated・unknown は指した手を除いた数（unknown は予算切れで調べなかった手を含む）。
+ *   checked は1回でも調べた手の数。examples は詰まされない手（USI。3つまで）。nodes は使った局面数の合計（本体はこれで予算を減らす）。
+ *   length は見つけた詰み手順の手数（詰み探索の置換表は呼び出しをまたいで残るので、最短とは限らない）。
+ * worker → 本体 { type:'error', id, message }
+ */
+(function (root, factory) {
+  const api = factory(root);
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  else root.ShogiAnalyze = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (root) {
+  'use strict';
+  const IN_NODE = typeof module === 'object' && !!module.exports;
+  const Core = IN_NODE ? require('./core.js') : root.ShogiCore;
+  const Search = IN_NODE ? require('./search.js') : root.ShogiSearch;
+
+  const now = (typeof performance !== 'undefined' && performance && typeof performance.now === 'function')
+    ? () => performance.now() : () => Date.now();
+  const MATE = 100000;
+  const PV_MAX = 12;
+  const EXAMPLES = 3;
+  const USI_RE = /^(?:[1-9][a-i][1-9][a-i]\+?|[PLNSGBR]\*[1-9][a-i])$/;
+
+  // Node のときだけ：学習した評価と詰み探索を、初めて使うときに読む（ページでは root にあるものを search.js が自分で見つける）
+  let nodeReady = false;
+  let nodeMate = null;
+  function nodeInit() {
+    if (!IN_NODE || nodeReady) return;
+    nodeReady = true;
+    try { if (!root.ShogiEvalKPWasm) root.ShogiEvalKPWasm = require('./evalkp_wasm.js'); } catch (e) { /* 無くても JS の計算で動く */ }
+    try {
+      const KP = require('./evalkp.js');
+      KP.init();
+      Search.setLearnedEval(KP.evaluator());
+    } catch (e) { /* 読めなければ手書きの評価で読む */ }
+    try {
+      nodeMate = require('./mate.js');
+      Search.setMate(nodeMate);
+    } catch (e) { nodeMate = null; }
+  }
+  function mateSolver() {
+    if (IN_NODE) { nodeInit(); return nodeMate; }
+    return root.ShogiMate && typeof root.ShogiMate.solve === 'function' ? root.ShogiMate : null;
+  }
+
+  function num(v, lo, hi, def) {
+    const x = Number(v);
+    if (!Number.isFinite(x)) return def;
+    return Math.max(lo, Math.min(hi, x));
+  }
+
+  function checkInput(o) {
+    if (!o || typeof o !== 'object') throw new Error('中身がありません');
+    if (typeof o.startSfen !== 'string') throw new Error('startSfen（文字列）がありません');
+    if (!Array.isArray(o.moves) || !o.moves.every((m) => typeof m === 'string')) {
+      throw new Error('moves は手（USI 文字列）の配列で渡してください');
+    }
+    return o.moves.slice();
+  }
+
+  // 開始局面から指し手を順に指した Game（指せない手があれば Error）
+  function gameAt(startSfen, moves) {
+    const g = new Core.Game(startSfen);
+    for (const m of moves) g.play(m);
+    return g;
+  }
+
+  // 1つの局面を読む
+  function evalPosition(o) {
+    const moves = checkInput(o);
+    if (IN_NODE) nodeInit();
+    const g = gameAt(o.startSfen, moves);
+    const st = g.status();
+    const turn = g.position().turn;
+    const n = moves.length;
+    if (st.over) {
+      const score = st.winner === 'b' ? MATE : st.winner === 'w' ? -MATE : 0;
+      return { n, turn, over: st.result, score, mate: 0, best: '', pv: [], depth: -1, nodes: 0, timeMs: 0, mateSearch: false };
+    }
+    const sgn = turn === 'b' ? 1 : -1;
+    const r = Search.search({
+      startSfen: o.startSfen, moves, timeMs: num(o.timeMs, 20, 60000, 1000),
+      learnedEval: true, book: false, mateSearch: true, mateShare: 0.1, mateGuard: false,
+    });
+    const pv = [];
+    for (const m of Array.isArray(r.pv) ? r.pv : []) {
+      if (pv.length >= PV_MAX || typeof m !== 'string' || !USI_RE.test(m)) break;
+      pv.push(m);
+    }
+    const best = typeof r.bestmove === 'string' && USI_RE.test(r.bestmove) ? r.bestmove : '';
+    return {
+      n, turn, over: null,
+      score: Number.isFinite(r.score) ? Math.round(r.score) * sgn : 0,
+      mate: Number.isFinite(r.mate) && r.mate ? r.mate * sgn : 0,
+      best, pv: best && pv[0] !== best ? [best] : pv,
+      depth: r.depth | 0, nodes: r.nodes | 0, timeMs: r.timeMs | 0, mateSearch: !!r.mateSearch,
+    };
+  }
+
+  // 最後の手を指したあとの局面で、相手に王手の連続の詰みがあるか。あれば、ほかの手で詰まされない手を数える
+  function trapCheck(o) {
+    const moves = checkInput(o);
+    const n = moves.length;
+    if (n < 1) throw new Error('調べる手がありません');
+    const t0 = now();
+    const g = gameAt(o.startSfen, moves);
+    const base = { n, result: 'skip', length: 0, pv: [], nodes: 0, timeMs: 0, alt: null };
+    if (g.status().over) return base;
+    const Mate = mateSolver();
+    if (!Mate) return Object.assign(base, { result: 'unknown' });
+    const maxNodes = Math.round(num(o.maxNodes, 1000, 20000000, 200000));
+    // 時間の上限は渡さない（局面数だけで切る）
+    const r = Mate.solve({ sfen: g.sfen(), maxNodes, shortest: true, shortestNodes: maxNodes });
+    let nodes = r.nodes | 0;
+    if (r.result !== 'mate') {
+      return Object.assign(base, { result: r.result === 'nomate' ? 'nomate' : 'unknown', nodes, timeMs: Math.round(now() - t0) });
+    }
+    // ほかの手：最後の手の前の局面（指した側の番）で、合法手を1つずつ指して調べる
+    const h = gameAt(o.startSfen, moves.slice(0, n - 1));
+    const played = moves[n - 1];
+    const legal = h.legalMoves();
+    const prefer = Array.isArray(o.prefer) ? o.prefer.filter((u) => u !== played && legal.indexOf(u) >= 0) : [];
+    const order = prefer.concat(legal.filter((u) => u !== played && prefer.indexOf(u) < 0));
+    // 2段で調べる：まず全部を小さな予算で（すぐ決まる手を先に片づける。全体の 4 割まで）、残った「分からない」手を大きな予算で。
+    // 予算は局面数（altTotal）で打ち切り、調べきれなかった手は「分からない」に数える
+    const altNodes = Math.round(num(o.altNodes, 500, 5000000, 15000));
+    const altTotal = Math.round(num(o.altTotal, 0, 200000000, 1000000));
+    const passes = [[Math.max(500, Math.round(altNodes / 10)), 0.4], [altNodes, 1]];
+    const res = new Map();
+    let used = 0, checked = 0;
+    for (const [budget, share] of passes) {
+      for (const u of order) {
+        const was = res.get(u);
+        if (was === 'mate' || was === 'nomate') continue;
+        const left = Math.floor(altTotal * share) - used;
+        if (left < 100) break;
+        h.play(u);
+        let out;
+        try {
+          if (h.status().over) out = 'nomate';   // その手で終局（相手を詰ました・千日手など）は、王手の連続で詰まされることはない
+          else {
+            const s = Mate.solve({ sfen: h.sfen(), maxNodes: Math.min(budget, left), shortest: false, pv: false });
+            used += s.nodes | 0;
+            out = s.result;
+          }
+        } finally {
+          h.undo();
+        }
+        if (was === undefined) checked++;
+        res.set(u, out);
+      }
+    }
+    nodes += used;
+    let safe = 0, mated = 0, unknown = 0;
+    const examples = [];
+    for (const u of order) {
+      const v = res.get(u);
+      if (v === 'mate') mated++;
+      else if (v === 'nomate') { safe++; if (examples.length < EXAMPLES) examples.push(u); }
+      else unknown++;
+    }
+    return {
+      n, result: 'mate', length: r.length | 0, pv: (r.pv || []).slice(0, PV_MAX), nodes, timeMs: Math.round(now() - t0),
+      alt: { total: legal.length, safe, mated, unknown, checked, examples },
+    };
+  }
+
+  // 本体からの知らせ1つに答える（Worker でも本体でも同じ）。知らない知らせは null
+  function handle(msg) {
+    if (!msg || typeof msg !== 'object') return null;
+    const id = msg.id;
+    try {
+      if (msg.type === 'eval') return Object.assign({ type: 'eval', id }, evalPosition(msg));
+      if (msg.type === 'trap') return Object.assign({ type: 'trap', id }, trapCheck(msg));
+      return null;
+    } catch (err) {
+      return { type: 'error', id, message: String((err && err.message) || err) };
+    }
+  }
+
+  // Worker の中だけ：知らせを受けて答える（Node・ページの本体では何もしない）
+  if (!IN_NODE && typeof root.postMessage === 'function' && typeof root.document === 'undefined' && Core && Search) {
+    root.onmessage = function (e) {
+      const r = handle(e && e.data);
+      if (r) root.postMessage(r);
+    };
+    try { root.postMessage({ type: 'ready' }); } catch (e) { /* 何もしない */ }
+  }
+
+  return { evalPosition, trapCheck, handle, VERSION: 1 };
+});
+</script>
 <script id="src-logic">
 /*
  * ui/logic.js — 画面の純粋な判断（DOM を触らない）→ ShogiUILogic
- * 座標変換・選択と行き先・成りの判定・評価値の表記・保存データの検査。
+ * 座標変換・選択と行き先・成りの判定・評価値の表記・保存データの検査・保存した棋譜の記録と見返しの局面（設計 §16）・
+ * 見返しの分析の記録と判定（悪手・詰み筋・まとめ・グラフの高さ。設計 §17）。
  * node でも、ブラウザ本体でも動く（設計.md 第2節の形）。
  */
 (function (root, factory) {
@@ -44444,6 +45358,693 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     return Math.max(1, Math.min(cap, cores - 1));
   }
 
+  /* ---------- 保存した棋譜（設計 §16） ----------
+   * 終わった対局を1件の記録にする・記録を確かめる・並べる・上限で切る・見返しの局面を作る。
+   * 置き場（IndexedDB・localStorage）を触るのは ui/app.js。ここは値を受け取って値を返すだけ。 */
+
+  const ARCHIVE_VERSION = 1;
+  const ARCHIVE_LIMIT = 500;
+  const RESULT_NAMES = {
+    checkmate: '詰み', no_moves: '指す手なし', resign: '投了',
+    sennichite: '千日手', perpetual_check: '連続王手の千日手', jishogi: '持将棋',
+  };
+  const OUTCOME_TEXT = { win: '勝ち', loss: '負け', draw: '引き分け' };
+  const OUTCOME_MARK = { win: '勝', loss: '負', draw: '分' };
+  const KIF_HEAD = '# KIF形式棋譜ファイル';
+  const RECORD_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+  const HANDICAP_KEY_RE = /^[a-z]{1,16}$/;
+
+  // 対局の名札（開始時刻のミリ秒から決める。待ったで指し直して終わっても同じ名札なので、上書きになる）
+  function gameRecordId(startedAt) {
+    return validTime(startedAt) ? 'g' + Math.round(startedAt) : null;
+  }
+
+  function archiveLimit(opts) {
+    const n = opts && opts.limit;
+    if (n === Infinity) return Infinity;
+    return Number.isInteger(n) && n > 0 ? n : ARCHIVE_LIMIT;
+  }
+
+  function shortText(v, max) {
+    return typeof v === 'string' && v.length > 0 && v.length <= max ? v : null;
+  }
+
+  // 保存した1件を確かめて、決まった形に直す。壊れていれば null（呼ぶ側は読み飛ばす）。
+  // 勝ち負け（outcome）と手数（plies）は、ほかの欄から計算し直す（保存された値を信じない）。
+  // 指し手が規則どおりかは、見返すとき（buildReview）に盤で確かめる。
+  function parseGameRecord(o, opts) {
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
+    if (o.v !== ARCHIVE_VERSION) return null;
+    if (typeof o.id !== 'string' || !RECORD_ID_RE.test(o.id)) return null;
+    if (typeof o.startSfen !== 'string' || !SFEN_RE.test(o.startSfen)) return null;
+    if (!Array.isArray(o.moves) || o.moves.length > 1000) return null;
+    for (const m of o.moves) if (!isUsi(m)) return null;
+    if (o.humanSide !== 'b' && o.humanSide !== 'w') return null;
+    if (typeof o.handicap !== 'string' || !HANDICAP_KEY_RE.test(o.handicap)) return null;
+    const handicaps = opts && Array.isArray(opts.handicaps) ? opts.handicaps : null;
+    if (handicaps && handicaps.indexOf(o.handicap) < 0) return null;
+    if (o.handicap !== 'hirate' && o.humanSide !== 'b') return null;
+    // 強さは、のちに段階の数が変わっても読めるよう、LEVELS に無い値も 1〜99 なら受け付ける（名前は levelName に残してある）
+    if (!Number.isInteger(o.level) || o.level < 1 || o.level > 99) return null;
+    if (!Object.prototype.hasOwnProperty.call(RESULT_NAMES, o.result)) return null;
+    if (o.winner != null && o.winner !== 'b' && o.winner !== 'w') return null;
+    if (o.resigned != null && o.resigned !== 'b' && o.resigned !== 'w') return null;
+    const winner = o.winner || null;
+    const resigned = o.resigned || null;
+    const drawn = o.result === 'sennichite' || o.result === 'jishogi';
+    if (drawn !== (winner === null)) return null;
+    if (o.result === 'resign') {
+      if (!resigned || winner !== opposite(resigned)) return null;
+    } else if (resigned) {
+      return null;
+    }
+    if (!validTime(o.startedAt) || !validTime(o.endedAt)) return null;
+    const kif = typeof o.kif === 'string' && o.kif.length <= 300000 && o.kif.indexOf(KIF_HEAD) === 0 ? o.kif : null;
+    // 分析の結果（設計 §17。無くてもよい欄）。形が壊れている・指し手と合わないときは分析だけを捨てる（記録は読む）
+    const analysis = o.analysis != null ? parseAnalysis(o.analysis, o) : null;
+    const out = {
+      v: ARCHIVE_VERSION,
+      id: o.id,
+      startedAt: o.startedAt,
+      endedAt: o.endedAt,
+      handicap: o.handicap,
+      handicapName: shortText(o.handicapName, 20),
+      startSfen: o.startSfen,
+      moves: o.moves.slice(),
+      humanSide: o.humanSide,
+      level: o.level,
+      levelName: shortText(o.levelName, 20),
+      result: o.result,
+      winner,
+      resigned,
+      outcome: winner === null ? 'draw' : winner === o.humanSide ? 'win' : 'loss',
+      plies: o.moves.length,
+      endText: shortText(o.endText, 200) || '',
+      kif,
+    };
+    if (analysis) out.analysis = analysis;
+    return out;
+  }
+
+  // 読めない記録（版が違う・形が壊れている）だけを、手を付けずに取り出す（置き場に書き直すときに残すため。消さない）
+  function unreadableRows(list, opts) {
+    return (Array.isArray(list) ? list : []).filter((x) => !parseGameRecord(x, opts));
+  }
+
+  // 終わった対局から、保存する1件を作る。呼ぶ側が Game から値を集めて渡す：
+  //   { startSfen, moves, humanSide, level, levelName, handicap, handicapName, status（Game.status()）, resigned, startedAt, endedAt, kif }
+  // 終わっていない・形が合わないときは null（保存しない）。
+  function buildGameRecord(src, opts) {
+    const s = src || {};
+    const st = s.status || {};
+    if (!st.over) return null;
+    const moves = Array.isArray(s.moves) ? s.moves.slice() : [];
+    const winner = st.winner === 'b' || st.winner === 'w' ? st.winner : null;
+    let resigned = null;
+    if (st.result === 'resign') resigned = s.resigned === 'b' || s.resigned === 'w' ? s.resigned : (winner ? opposite(winner) : null);
+    return parseGameRecord({
+      v: ARCHIVE_VERSION,
+      id: gameRecordId(s.startedAt),
+      startedAt: s.startedAt,
+      endedAt: s.endedAt,
+      handicap: s.handicap,
+      handicapName: s.handicapName,
+      startSfen: s.startSfen,
+      moves,
+      humanSide: s.humanSide,
+      level: s.level,
+      levelName: s.levelName,
+      result: st.result,
+      winner,
+      resigned,
+      endText: typeof st.text === 'string' ? st.text : '',
+      kif: s.kif,
+    }, opts);
+  }
+
+  // 並べ方：始めた時刻の新しい順（同じなら終わった時刻の新しい順、それも同じなら名札の順）
+  function compareRecords(a, b) {
+    if (a.startedAt !== b.startedAt) return b.startedAt - a.startedAt;
+    if (a.endedAt !== b.endedAt) return b.endedAt - a.endedAt;
+    return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+  }
+
+  // 同じ名札の記録が2つあれば、後で終わった方を使う
+  function newerRecord(a, b) {
+    return a.endedAt > b.endedAt;
+  }
+
+  // 置き場から読んだ並び → { records（新しい順・上限まで）, removed（上限を超えた古いものの名札）, broken（読み飛ばした数） }
+  function normalizeArchive(list, opts) {
+    const limit = archiveLimit(opts);
+    const byId = new Map();
+    let broken = 0;
+    for (const x of Array.isArray(list) ? list : []) {
+      const r = parseGameRecord(x, opts);
+      if (!r) { broken++; continue; }
+      const old = byId.get(r.id);
+      if (!old || newerRecord(r, old)) byId.set(r.id, r);
+    }
+    const all = Array.from(byId.values()).sort(compareRecords);
+    return { records: all.slice(0, limit), removed: all.slice(limit).map((r) => r.id), broken };
+  }
+
+  // 1件を足す（同じ名札があれば置き換える＝同じ対局が2つ並ばない）。上限を超えたら、足した1件は残して古いものから外す。
+  // → { records, removed, broken }。足す1件が壊れていれば null
+  function addToArchive(list, rec, opts) {
+    const r = parseGameRecord(rec, opts);
+    if (!r) return null;
+    const limit = archiveLimit(opts);
+    const rest = (Array.isArray(list) ? list : []).filter((x) => !(x && x.id === r.id));
+    const others = normalizeArchive(rest, Object.assign({}, opts, { limit: Infinity }));
+    const room = Math.max(0, limit - 1);
+    return {
+      records: others.records.slice(0, room).concat([r]).sort(compareRecords),
+      removed: others.records.slice(room).map((x) => x.id),
+      broken: others.broken,
+    };
+  }
+
+  // 別の置き場（extra）の記録を base に合わせるときの段取り（localStorage に入っていた分を IndexedDB へ移すとき）。
+  // → { puts（base に無い・base より新しい記録）, removed（合わせると上限を超えて外れる base の名札） }
+  function mergeArchive(base, extra, opts) {
+    const have = normalizeArchive(base, Object.assign({}, opts, { limit: Infinity }));
+    const haveMap = new Map(have.records.map((r) => [r.id, r]));
+    const add = normalizeArchive(extra, Object.assign({}, opts, { limit: Infinity }));
+    const puts = add.records.filter((r) => !haveMap.has(r.id) || newerRecord(r, haveMap.get(r.id)));
+    const merged = normalizeArchive(have.records.filter((r) => !puts.some((p) => p.id === r.id)).concat(puts), opts);
+    const gone = new Set(merged.removed);
+    return {
+      puts: puts.filter((r) => !gone.has(r.id)),
+      removed: merged.removed.filter((id) => haveMap.has(id)),
+    };
+  }
+
+  // 'YYYY/MM/DD HH:MM'（この端末の時刻）
+  function formatDateTime(ms) {
+    if (!validTime(ms)) return '';
+    const d = new Date(ms);
+    const p2 = (v) => String(v).padStart(2, '0');
+    return d.getFullYear() + '/' + p2(d.getMonth() + 1) + '/' + p2(d.getDate()) + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+  }
+
+  // 一覧・見返しに出す文。opts = { levels, handicapNames }
+  function recordSummary(rec, opts) {
+    const o = opts || {};
+    const handi = rec.handicap !== 'hirate';
+    const handicap = rec.handicapName || (o.handicapNames && o.handicapNames[rec.handicap]) || rec.handicap;
+    const side = sideName(rec.humanSide, handi);
+    const lv = rec.levelName || levelName(o.levels, rec.level);
+    const opponent = 'Lv' + rec.level + ' ' + lv;
+    const outcomeText = OUTCOME_TEXT[rec.outcome] || '';
+    const how = RESULT_NAMES[rec.result] || '';
+    const date = formatDateTime(rec.startedAt);
+    const plies = rec.plies + '手';
+    const who = rec.outcome === 'win' ? 'あなたの勝ち' : rec.outcome === 'loss' ? 'あなたの負け' : '引き分け';
+    return {
+      date, handicap, side, opponent, how, plies,
+      outcome: rec.outcome, outcomeText, mark: OUTCOME_MARK[rec.outcome] || '',
+      line1: date,
+      line2: handicap + ' · あなた' + side + ' · 相手 ' + opponent,
+      line3: plies + ' · ' + how + 'で' + outcomeText,
+      label: date + ' の対局。' + handicap + '、あなたは' + side + '、相手は ' + opponent + '。' + plies + '、' + how + 'で' + who + '。',
+    };
+  }
+
+  // 見返し：開始の局面から指し手を順に指して、各手数の局面（Game.position() の形）を作る。
+  // Core は ShogiCore（node でもページでも同じ物）。指せない手があれば null（その記録は読めない）。
+  // 返す物：{ game（最後まで指した Game。KIF を作り直すとき用）, positions（0〜手数の局面）, records（Game.records()）, status, resigned }
+  function buildReview(Core, rec) {
+    if (!Core || typeof Core.Game !== 'function' || !rec || !Array.isArray(rec.moves)) return null;
+    try {
+      const g = new Core.Game(rec.startSfen);
+      const positions = [g.position()];
+      for (const m of rec.moves) {
+        if (!isUsi(m)) return null;
+        g.play(m);
+        positions.push(g.position());
+      }
+      if ((rec.resigned === 'b' || rec.resigned === 'w') && !g.status().over) g.resign(rec.resigned);
+      const resigned = typeof g.resigned === 'function' ? g.resigned() : (rec.resigned || null);
+      return { game: g, positions, records: g.records(), status: g.status(), resigned };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // 見返しの手数を動かす。action：'first'・'prev'・'next'・'last' か、行きたい手数（整数）。0〜n に収める
+  function reviewStep(index, action, n) {
+    const max = Number.isInteger(n) && n > 0 ? n : 0;
+    let i = Number.isInteger(index) ? index : 0;
+    if (action === 'first') i = 0;
+    else if (action === 'prev') i -= 1;
+    else if (action === 'next') i += 1;
+    else if (action === 'last') i = max;
+    else if (Number.isInteger(action)) i = action;
+    return Math.max(0, Math.min(max, i));
+  }
+
+  // キーボード：左＝1手戻る、右＝1手進む、Home＝最初、End＝最後
+  const REVIEW_KEYS = { ArrowLeft: 'prev', ArrowRight: 'next', Home: 'first', End: 'last' };
+  function reviewKeyAction(key) {
+    return Object.prototype.hasOwnProperty.call(REVIEW_KEYS, key) ? REVIEW_KEYS[key] : null;
+  }
+
+  // 見返している手数の文 → { text:'12手目　▲７六歩'（0 手目は '開始局面'）, count:'12／87手' }
+  function reviewPositionText(rv, index) {
+    const n = rv && Array.isArray(rv.positions) ? rv.positions.length - 1 : 0;
+    const i = reviewStep(index, index, n);
+    const count = i + '／' + n + '手';
+    if (i === 0) return { text: '開始局面', count };
+    const r = rv.records && rv.records[i - 1];
+    return { text: i + '手目　' + (r && r.jp ? String(r.jp) : ''), count };
+  }
+
+  /* ---------- 見返しの分析（設計 §17） ----------
+   * 見返しの画面の「分析」：各局面を AI に読み直させた点数と、手ごとの「その手で詰み筋に入ったか」の調べを、記録の analysis 欄に入れる。
+   * ここは値を受け取って値を返すだけ（読むのは engine/analyze_worker.js、つなぐのは ui/app.js）。
+   *
+   * analysis（記録の版は 1 のまま、無くてもよい欄として足した。古い記録はそのまま読める）：
+   *   { v:1, ms:1局面に読む時間, at:分析した時刻, sig:開始局面と指し手の確かめの値（analysisSig）, done:最後まで読んだか,
+   *     main?:本体で読んだ（時間を縮めた）,
+   *     pos:[ 局面ごと（0〜手数）：null（まだ）か [点数, 詰み, 深さ, 最善手, 読み筋] ],
+   *     trap:{ 手数: [判定, 詰みの手数, 合法手の数, 詰まされない手, 詰まされる手, 分からない手, 例] } }
+   *   点数・詰みは先手から見た値（点数は歩1枚≒100・詰みは ±(100000 − 手数)、詰みは手数で 0 は詰みなし）。
+   *   深さ −1 は終局の局面（読んでいない）。最善手は USI（無ければ ''）、読み筋は USI を空白でつないだ文字（8手まで）。
+   *   判定：1＝この手で詰み筋に入った（その局面に詰まされない手があった）、2＝詰まされる（ほかの手を全部調べて、どれも詰まされた）、
+   *         3＝この手のあとに詰みはあるが、ほかの手で詰まされないかは分からない（ほかの手を調べきれなかった。続きで調べ直す）、
+   *         0＝王手の連続では詰まない、−1＝分からない（予算切れ）。例は詰まされない手（USI を空白でつないだ文字。3つまで）。
+   *   「合法手の数」は指した手を含む。「詰まされない手・詰まされる手・分からない手」は指した手を除いた数。
+   *   前の版が「詰まされない手なし・分からない手あり」を 2 で残した欄は、読むときに 3 に直す。 */
+
+  const ANALYSIS_VERSION = 1;
+  // 1局面に読む時間と、詰み筋の調べの予算（trap）。詰み筋の予算はどれも局面数で決める（時計の時間で切らない＝端末の速さに左右されない）：
+  //   nodes：指した手のあとの詰み探索の上限（手順の取り出しと、最短の手順の確かめにも、それぞれ同じだけまで使う）
+  //   altNodes：ほかの手1つを調べる上限（2段目。1段目はその 1/10）、altTotal：1回の調べで、ほかの手の全部に使う上限
+  //   perPly：詰み筋の調べ全部の予算（手数＋1 を掛ける。この Mac でおよそ局面を読む時間の 3 割）
+  const ANALYSIS_SPEEDS = [
+    { key: 'fast', name: '速い', ms: 300, trap: { nodes: 100000, altNodes: 15000, altTotal: 1600000, perPly: 60000 } },
+    { key: 'normal', name: 'ふつう', ms: 1000, trap: { nodes: 200000, altNodes: 40000, altTotal: 4000000, perPly: 200000 } },
+    { key: 'deep', name: 'じっくり', ms: 3000, trap: { nodes: 400000, altNodes: 80000, altTotal: 10000000, perPly: 600000 } },
+  ];
+  // Worker が使えず本体で読むときの上限（画面を止めすぎない。詰み筋はほとんど調べられない）
+  const ANALYSIS_MAIN = { ms: 500, gapMs: 40, nodes: 40000, altNodes: 4000, altTotal: 120000, trapMaxNodes: 10000000 };
+  const BAD_DROP = 300;        // 悪手：指した側から見た点数がこれ以上落ちた
+  const BLUNDER_DROP = 800;    // 大悪手
+  const EVAL_CAP = 2000;       // 点数の差を比べるときの上限（勝ちが決まった局面どうしの差を数えない。詰みはこの値）
+  const MATE_LIKE = 99000;     // 点数の大きさがこれ以上なら詰み（終局を含む）
+  const TRAP_MAX_NODES = 120000000;   // 詰み筋の調べ全部の予算の上限（局面数）
+  const TRAP_RATE = 300;       // 目安の時間に使う詰み探索の速さ（局面／ミリ秒。この Mac は約 640。スマホを見込んで遅めに見る）
+  const PV_KEEP = 8;
+
+  function analysisSpeed(k) {
+    return ANALYSIS_SPEEDS.find((s) => s.key === k || s.ms === k) || ANALYSIS_SPEEDS[1];
+  }
+
+  // 開始局面と指し手の確かめの値（FNV-1a 32bit の16進8桁）。分析が別の指し手の物でないことを確かめる
+  function analysisSig(startSfen, moves) {
+    const s = String(startSfen) + '|' + (Array.isArray(moves) ? moves.join(' ') : '');
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return ('0000000' + h.toString(16)).slice(-8);
+  }
+
+  function usiList(p) {
+    return typeof p === 'string' && p.length <= 200 && (p === '' || p.split(' ').every(isUsi));
+  }
+  function parseEntry(e) {
+    if (!Array.isArray(e) || e.length !== 5) return null;
+    const [s, m, d, b, p] = e;
+    if (!Number.isInteger(s) || Math.abs(s) > MATE_SCORE) return null;
+    if (!Number.isInteger(m) || Math.abs(m) > 9999) return null;
+    if (!Number.isInteger(d) || d < -1 || d > 999) return null;
+    if (typeof b !== 'string' || (b !== '' && !isUsi(b))) return null;
+    if (!usiList(p)) return null;
+    return [s, m, d, b, p];
+  }
+  function parseTrap(t) {
+    if (!Array.isArray(t) || t.length !== 7) return null;
+    const [st, len, total, safe, mated, unknown, ex] = t;
+    if ([-1, 0, 1, 2, 3].indexOf(st) < 0) return null;
+    for (const v of [len, total, safe, mated, unknown]) if (!Number.isInteger(v) || v < 0 || v > 9999) return null;
+    if (!usiList(ex) || ex.length > 40) return null;
+    // 前の版は、ほかの手を調べきれなかったときも「詰まされる（2）」で残していた → 「ほかの手は分からない（3）」に直す
+    return [st === 2 && unknown > 0 ? 3 : st, len, total, safe, mated, unknown, ex];
+  }
+
+  // 記録（startSfen・moves を持つ物）の分析の欄を確かめて決まった形に直す。壊れている・指し手と合わなければ null
+  function parseAnalysis(a, rec) {
+    if (!a || typeof a !== 'object' || Array.isArray(a) || !rec || !Array.isArray(rec.moves)) return null;
+    if (a.v !== ANALYSIS_VERSION) return null;
+    if (!Number.isInteger(a.ms) || a.ms < 20 || a.ms > 60000) return null;
+    if (!validTime(a.at)) return null;
+    if (a.sig !== analysisSig(rec.startSfen, rec.moves)) return null;
+    const n = rec.moves.length;
+    if (!Array.isArray(a.pos) || a.pos.length !== n + 1) return null;
+    const pos = [];
+    for (const e of a.pos) {
+      if (e === null) { pos.push(null); continue; }
+      const x = parseEntry(e);
+      if (!x) return null;
+      pos.push(x);
+    }
+    const trap = {};
+    if (a.trap != null) {
+      if (typeof a.trap !== 'object' || Array.isArray(a.trap)) return null;
+      for (const k of Object.keys(a.trap)) {
+        const i = Number(k);
+        if (!Number.isInteger(i) || i < 1 || i > n || String(i) !== k) return null;
+        const t = parseTrap(a.trap[k]);
+        if (!t) return null;
+        trap[i] = t;
+      }
+    }
+    const out = { v: ANALYSIS_VERSION, ms: a.ms, at: a.at, sig: a.sig, done: a.done === true && pos.every((x) => x !== null), pos, trap };
+    if (a.main === true) out.main = true;
+    return out;
+  }
+
+  function cloneAnalysis(a) {
+    return a ? JSON.parse(JSON.stringify(a)) : null;
+  }
+
+  // 終局の局面（詰み・千日手など）の欄：読まずに埋める。勝った側から見て詰み、引き分けは 0
+  function terminalEntry(status) {
+    const w = status && status.winner;
+    return [w === 'b' ? MATE_SCORE : w === 'w' ? -MATE_SCORE : 0, 0, -1, '', ''];
+  }
+
+  // 分析を始める（続きから読むか、最初から読むか）。
+  // prev（記録の分析）が途中で止めた物で、同じ時間・同じ指し手・同じ読み方（本体か Worker か）なら、その続き。
+  // 済んだ分析・時間を変えたときは最初から（時間を変えて分析し直せる）。opts = { now, main, status（見返しの最後の局面の Game.status()） }
+  function startAnalysis(prev, rec, speedKey, opts) {
+    const o = opts || {};
+    const sp = analysisSpeed(speedKey);
+    const n = rec.moves.length;
+    const sig = analysisSig(rec.startSfen, rec.moves);
+    let a;
+    if (prev && !prev.done && prev.ms === sp.ms && prev.sig === sig && !!prev.main === !!o.main && Array.isArray(prev.pos) && prev.pos.length === n + 1) {
+      a = cloneAnalysis(prev);
+    } else {
+      a = { v: ANALYSIS_VERSION, ms: sp.ms, at: 0, sig, done: false, pos: new Array(n + 1).fill(null), trap: {} };
+    }
+    a.at = validTime(o.now) ? Math.round(o.now) : Date.now();
+    a.done = false;
+    if (o.main) a.main = true; else delete a.main;
+    const st = o.status;
+    if (st && st.over && st.result !== 'resign' && a.pos[n] === null) a.pos[n] = terminalEntry(st);
+    return a;
+  }
+
+  // 続きから読める分析か（同じ時間を選べば続き）
+  function canResume(prev, speedKey, main) {
+    const sp = analysisSpeed(speedKey);
+    return !!prev && !prev.done && prev.ms === sp.ms && !!prev.main === !!main && prev.pos.some((x) => x !== null);
+  }
+
+  // 分析の Worker の返事 → 局面の欄
+  function clampInt(v, lo, hi) {
+    const x = Math.round(Number(v));
+    return Number.isFinite(x) ? Math.max(lo, Math.min(hi, x)) : 0;
+  }
+  function analysisEntry(r) {
+    if (!r || typeof r !== 'object') return null;
+    if (r.over) return [clampInt(r.score, -MATE_SCORE, MATE_SCORE), 0, -1, '', ''];
+    const pv = [];
+    for (const m of Array.isArray(r.pv) ? r.pv : []) {
+      if (pv.length >= PV_KEEP || !isUsi(m)) break;
+      pv.push(m);
+    }
+    return [clampInt(r.score, -MATE_SCORE, MATE_SCORE), clampInt(r.mate, -9999, 9999), clampInt(r.depth, 0, 999),
+      isUsi(r.best) ? r.best : '', pv.join(' ')];
+  }
+  // 詰み筋の調べの返事 → 手の欄。
+  // 詰まされない手が1つでもあれば 1。無いとき、ほかの手を全部調べて全部詰まされたときだけ 2（詰まされる）にし、
+  // 調べきれなかった手がある（1つも調べていないときを含む）・返事にほかの手の数が無いときは 3（ほかの手は分からない）
+  function trapEntry(r) {
+    if (!r || typeof r !== 'object' || r.result === 'unknown') return [-1, 0, 0, 0, 0, 0, ''];
+    if (r.result !== 'mate') return [0, 0, 0, 0, 0, 0, ''];
+    const has = !!(r.alt && typeof r.alt === 'object');
+    const a = has ? r.alt : {};
+    const total = clampInt(a.total, 0, 9999), safe = clampInt(a.safe, 0, 9999), mated = clampInt(a.mated, 0, 9999);
+    // 分からない手：返事の数と、合法手から数え直した数（指した手・詰まされない手・詰まされる手を除いた残り）の大きい方
+    const unknown = Math.max(clampInt(a.unknown, 0, 9999), Math.max(0, total - 1 - safe - mated));
+    const ex = [];
+    for (const u of Array.isArray(a.examples) ? a.examples : []) { if (ex.length < 3 && isUsi(u)) ex.push(u); }
+    const st = safe > 0 ? 1 : (!has || unknown > 0) ? 3 : 2;
+    return [st, clampInt(r.length, 0, 9999), total, safe, mated, unknown, ex.join(' ')];
+  }
+
+  // 読み終わった局面の数
+  function analysisProgress(a, rec) {
+    const total = a && Array.isArray(a.pos) ? a.pos.length : (rec ? rec.moves.length + 1 : 0);
+    const done = a && Array.isArray(a.pos) ? a.pos.filter((x) => x !== null).length : 0;
+    return { done, total, traps: a && a.trap ? Object.keys(a.trap).length : 0 };
+  }
+
+  // 局面の欄 → 先手から見た、±EVAL_CAP で切った値（詰みは ±EVAL_CAP）
+  function entryValue(e) {
+    if (!e) return null;
+    const m = entryMater(e);
+    if (m) return m === 'b' ? EVAL_CAP : -EVAL_CAP;
+    return Math.max(-EVAL_CAP, Math.min(EVAL_CAP, e[0]));
+  }
+  // 詰ます側（'b'｜'w'｜null）
+  function entryMater(e) {
+    if (!e) return null;
+    if (e[1] !== 0) return e[1] > 0 ? 'b' : 'w';
+    if (Math.abs(e[0]) >= MATE_LIKE) return e[0] > 0 ? 'b' : 'w';
+    return null;
+  }
+  const sideVal = (v, side) => (v === null ? null : side === 'b' ? v : -v);
+
+  function trapInfo(t) {
+    return { st: t[0], len: t[1], total: t[2], safe: t[3], mated: t[4], unknown: t[5], ex: t[6] ? t[6].split(' ') : [] };
+  }
+
+  // 手ごとの判定（添字＝手数。0 は null）：
+  //   { n, side（指した側）, drop（指した側から見て点数がどれだけ落ちたか。分からなければ null）,
+  //     grade（''｜'bad' 悪手｜'blunder' 大悪手）, trap（詰み筋の調べ。trapInfo か null）, best・pv（その手の前の局面の AI の最善手と読み筋） }
+  // AI の最善手と同じ手は、点数が落ちても悪手にしない（読みの深さの違いで出る差のため）
+  function moveJudgements(a, rec) {
+    const out = [null];
+    if (!a || !rec || !Array.isArray(a.pos)) return out;
+    const startTurn = sfenTurn(rec.startSfen);
+    for (let n = 1; n <= rec.moves.length; n++) {
+      const side = sideOfPly(startTurn, n - 1);
+      const e0 = a.pos[n - 1], e1 = a.pos[n];
+      let drop = null, grade = '';
+      if (e0 && e1) {
+        drop = sideVal(entryValue(e0), side) - sideVal(entryValue(e1), side);
+        if (!(e0[3] && e0[3] === rec.moves[n - 1])) {
+          if (drop >= BLUNDER_DROP) grade = 'blunder';
+          else if (drop >= BAD_DROP) grade = 'bad';
+        }
+      }
+      const t = a.trap && a.trap[n];
+      out.push({ n, side, drop, grade, trap: t ? trapInfo(t) : null, best: e0 ? e0[3] : '', pv: e0 ? e0[4] : '' });
+    }
+    return out;
+  }
+
+  // 勝負を分けた手（負けた側の手）：その手で詰み筋に入った最初の手。無ければ、まだ勝負が決まっていなかった局面
+  // （勝った側から見て +1000 未満）で、点数がいちばん大きく落ちた悪手。引き分け・見当たらなければ null
+  function decisiveMove(a, rec, judg) {
+    const winner = rec && (rec.winner === 'b' || rec.winner === 'w') ? rec.winner : null;
+    if (!winner || !a) return null;
+    const loser = opposite(winner);
+    const js = (judg || moveJudgements(a, rec)).filter((j) => j && j.side === loser);
+    const tr = js.find((j) => j.trap && j.trap.st === 1);
+    if (tr) return tr.n;
+    let best = null;
+    for (const j of js) {
+      if (!j.grade) continue;
+      if (sideVal(entryValue(a.pos[j.n - 1]), winner) >= 1000) continue;
+      if (!best || j.drop > best.drop) best = j;
+    }
+    return best ? best.n : null;
+  }
+
+  // まとめ：{ done, total, you:{ bad, blunder, trap }, ai:{ … }, marks:[{ n, side, grade, trap }]（印の付いた手・手数の順）, decisive }
+  function analysisSummary(a, rec, judg) {
+    const j = judg || moveJudgements(a, rec);
+    const pr = analysisProgress(a, rec);
+    const you = { bad: 0, blunder: 0, trap: 0 }, ai = { bad: 0, blunder: 0, trap: 0 };
+    const marks = [];
+    for (const x of j) {
+      if (!x) continue;
+      const trap = !!(x.trap && x.trap.st === 1);
+      if (!x.grade && !trap) continue;
+      const box = x.side === rec.humanSide ? you : ai;
+      if (x.grade) box[x.grade]++;
+      if (trap) box.trap++;
+      marks.push({ n: x.n, side: x.side, grade: x.grade, trap });
+    }
+    return { done: pr.done, total: pr.total, traps: pr.traps, you, ai, marks, decisive: decisiveMove(a, rec, j) };
+  }
+
+  // 詰み筋を調べる手の順（まだ調べていない手と、前に「ほかの手は分からない（3）」だった手。重いので予算の範囲で前から調べる）：
+  //   勝ち負けのある対局は、負けた側の手を先に、勝った側の手を後に（勝負を分けた手は負けた側の手なので）。それぞれの側の中は
+  //   1. 読みで、指したあとの局面に相手の詰みが見えた手（手数の順）
+  //   2. 大悪手（点数が大きく落ちた順）  3. 悪手（同じ）
+  //   4. 終盤（後ろ半分）で、まだ勝負が決まっていない局面の手（後ろから）
+  // 引き分けは両方の側をまぜて同じ順。調べている間の並べ替え（詰み筋が見つかった側の後ろの手を後回し）は trapNext。
+  // 指す前からもう詰まされる形だった手・指した側が詰ませる形になった手・終局した手は調べない
+  function trapCandidates(a, rec, judg) {
+    const N = rec.moves.length;
+    const j = judg || moveJudgements(a, rec);
+    const winner = rec.winner === 'b' || rec.winner === 'w' ? rec.winner : null;
+    const groups = winner ? [opposite(winner), winner] : [null];
+    const out = [];
+    for (const g of groups) {
+      const p0 = [], p1 = [], p2 = [], p3 = [];
+      for (let n = 1; n <= N; n++) {
+        const t = a.trap && a.trap[n];
+        if (t && t[0] !== 3) continue;
+        const e0 = a.pos[n - 1], e1 = a.pos[n];
+        if (!e0 || !e1 || e1[2] === -1) continue;
+        const x = j[n], side = x.side, opp = opposite(side);
+        if (g && side !== g) continue;
+        if (entryMater(e0) === opp || entryMater(e1) === side) continue;
+        const v0 = sideVal(entryValue(e0), side), v1 = sideVal(entryValue(e1), side);
+        if (entryMater(e1) === opp) p0.push(x);
+        else if (x.drop >= BLUNDER_DROP) p1.push(x);
+        else if (x.drop >= BAD_DROP) p2.push(x);
+        else if (n * 2 > N && v0 > -1500 && v1 < 1500) p3.push(x);
+        else if (t) p3.push(x);   // 前に詰みが見つかった手は、終盤の条件から外れても調べ直す
+      }
+      p0.sort((x, y) => x.n - y.n);
+      p1.sort((x, y) => y.drop - x.drop || x.n - y.n);
+      p2.sort((x, y) => y.drop - x.drop || x.n - y.n);
+      p3.sort((x, y) => y.n - x.n);
+      for (const x of p0.concat(p1, p2, p3)) out.push(x.n);
+    }
+    return out;
+  }
+
+  // 次に調べる手（list の添字。無ければ −1）。list は trapCandidates の並び。
+  // ある側に「詰み筋に入った手（判定 1）」がもう見つかっていれば、その側のそれより後ろの手は後回しにする
+  // （勝負を分けた手＝負けた側のいちばん前の詰み筋の手なので、その前の手を先に調べる）。全部が後回しなら先頭
+  function trapNext(list, a, rec) {
+    if (!Array.isArray(list) || !list.length) return -1;
+    const startTurn = sfenTurn(rec.startSfen);
+    const first = { b: Infinity, w: Infinity };
+    for (const k of Object.keys((a && a.trap) || {})) {
+      const t = a.trap[k], n = Number(k);
+      if (!t || t[0] !== 1 || !Number.isInteger(n)) continue;
+      const s = sideOfPly(startTurn, n - 1);
+      if (n < first[s]) first[s] = n;
+    }
+    for (let i = 0; i < list.length; i++) {
+      const n = list[i];
+      if (n < first[sideOfPly(startTurn, n - 1)]) return i;
+    }
+    return 0;
+  }
+
+  // 詰み筋の調べの1回の予算（局面数。本体で読むときは小さく）：{ nodes, altNodes, altTotal }
+  function trapBudget(speedKey, main) {
+    const t = analysisSpeed(speedKey).trap;
+    const M = ANALYSIS_MAIN;
+    return main
+      ? { nodes: Math.min(t.nodes, M.nodes), altNodes: Math.min(t.altNodes, M.altNodes), altTotal: Math.min(t.altTotal, M.altTotal) }
+      : { nodes: t.nodes, altNodes: t.altNodes, altTotal: t.altTotal };
+  }
+  // 1回の調べを始めるのに要る残りの予算（指した手のあとの詰み探索と手順の分 ＋ ほかの手の調べの 4 分の 1）。
+  // これより少なければ、その手は始めない（ほかの手を調べられずに「分からない」で終わらせない）
+  function trapCallMin(b) {
+    return 2 * b.nodes + Math.ceil(b.altTotal / 4);
+  }
+  // 1局面に読む時間（本体で読むときは短く）
+  function analysisMs(speedKey, main) {
+    const ms = analysisSpeed(speedKey).ms;
+    return main ? Math.min(ms, ANALYSIS_MAIN.ms) : ms;
+  }
+  // 詰み筋の調べ全部の予算（局面数）：（手数＋1）× 1手あたり。少なくとも1回分は調べられる・上限まで
+  function trapBudgetNodes(speedKey, plies, main) {
+    const sp = analysisSpeed(speedKey);
+    const b = trapBudget(speedKey, main);
+    const hi = main ? ANALYSIS_MAIN.trapMaxNodes : TRAP_MAX_NODES;
+    const total = (Math.max(0, plies | 0) + 1) * sp.trap.perPly;
+    return Math.round(Math.min(hi, Math.max(2 * b.nodes + b.altTotal, total)));
+  }
+  // 詰み筋の調べ全部にかかる時間の目安（ミリ秒。遅めの端末を見込んだ長めの値。予算を使い切る前に候補が尽きれば早く終わる）
+  function trapBudgetMs(speedKey, plies, main) {
+    return Math.round(trapBudgetNodes(speedKey, plies, main) / TRAP_RATE);
+  }
+  // 目安の秒数（長めに見る。読みは落ち着けば早めに終わる）。done：もう読んである局面の数（続きから読むとき）
+  function analysisEstimateSec(plies, speedKey, opts) {
+    const o = opts || {};
+    const left = Math.max(0, (plies | 0) + 1 - (o.done | 0));
+    const per = analysisMs(speedKey, o.main) + (o.main ? ANALYSIS_MAIN.gapMs : 0);
+    return Math.ceil((left * per + trapBudgetMs(speedKey, plies, o.main)) / 1000);
+  }
+  function formatDuration(sec) {
+    const s = Math.max(0, Math.round(Number(sec) || 0));
+    const r10 = Math.max(10, Math.ceil(s / 10) * 10);
+    if (r10 < 60) return '約' + r10 + '秒';
+    if (s < 3600) return '約' + Math.max(1, Math.round(s / 60)) + '分';
+    return '約' + (Math.round(s / 360) / 10) + '時間';
+  }
+
+  // グラフの高さ（−1〜1。上があなた有利。詰みは上下の端）
+  function graphValue(e, humanSide) {
+    if (!e) return null;
+    const m = entryMater(e);
+    if (m) return m === humanSide ? 1 : -1;
+    const v = sideVal(Math.max(-2 * EVAL_CAP, Math.min(2 * EVAL_CAP, e[0])), humanSide);
+    const y = Math.tanh(v / 1200);
+    return y === 0 ? 0 : y;   // −0 にしない
+  }
+
+  // 局面の欄 → あなたから見た点数の文 { text, label }。status は見返しの最後の局面の Game.status()（終局の局面のとき）。
+  // 終局の局面は、詰み（checkmate）のときだけ「詰み」、ほか（連続王手の千日手・指す手なしなど）は「終局」と出す
+  function analysisEvalText(e, humanSide, status) {
+    if (!e) return { text: '', label: '' };
+    if (e[2] === -1) {
+      const m = entryMater(e);
+      const how = status && RESULT_NAMES[status.result];
+      if (!m) return { text: '±0', label: '終局（' + (how || '引き分け') + '）' };
+      const who = m === humanSide ? 'あなたの勝ち' : 'AIの勝ち';
+      if (status && status.result === 'checkmate') return { text: '詰み', label: '終局（' + who + '）' };
+      return { text: '終局', label: '終局（' + (how ? how + '・' : '') + who + '）' };
+    }
+    const h = toHumanPerspective(e[0], e[1] || null, 'b', humanSide);
+    const f = formatEval(h.score, h.mate);
+    return { text: f.text, label: f.label };
+  }
+
+  // 短い点数の文（手の位置の行の横に出す）：+120／−詰9（AI が 9 手で詰ます）／+詰3（あなたが詰ます）／終局
+  function analysisShortText(e, humanSide) {
+    if (!e) return '';
+    if (e[2] === -1) return '終局';
+    const m = entryMater(e);
+    if (m) {
+      const n = e[1] !== 0 ? Math.abs(e[1]) : Math.max(0, MATE_SCORE - Math.abs(e[0]));
+      return (m === humanSide ? '+' : MINUS) + '詰' + (n > 0 ? n : '');
+    }
+    return analysisEvalText(e, humanSide).text;
+  }
+
+  // 落ちた点数の文（あなたから見た向きではなく、指した側から見た大きさ）
+  function dropText(d) {
+    if (typeof d !== 'number' || !isFinite(d)) return '';
+    const v = Math.round(d);
+    return v === 0 ? '±0' : v > 0 ? MINUS + v : '+' + -v;
+  }
+  const GRADE_NAMES = { bad: '悪手', blunder: '大悪手' };
+
+  // 詰み筋の調べで見つけた詰みの手数の文（詰み探索の置換表は呼び出しをまたいで残るので、前に何を調べたかで手数が変わる）
+  function mateLenText(len) {
+    return len + '手詰め（見つけた手順の手数。最短とは限りません）';
+  }
+
+  // 詰み筋の候補のうち、まだ調べていない手（と、ほかの手を調べきれなかった手）の数。全部の局面を読む前は null
+  function trapRest(a, rec, judg) {
+    if (!a || !rec || !Array.isArray(a.pos) || a.pos.some((x) => x === null)) return null;
+    return trapCandidates(a, rec, judg).length;
+  }
+
   /* ---------- 読み上げの文 ---------- */
 
   function squareAria(sq, code, handicapped, note) {
@@ -44467,6 +46068,15 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     serializeState, parseSavedState, SAVE_VERSION,
     pvNotation, squareAria,
     smpWorkerCount, SMP_CAP_DESKTOP, SMP_CAP_MOBILE,
+    ARCHIVE_VERSION, ARCHIVE_LIMIT, RESULT_NAMES,
+    gameRecordId, parseGameRecord, buildGameRecord, compareRecords, normalizeArchive, addToArchive, mergeArchive, unreadableRows,
+    formatDateTime, recordSummary, buildReview, reviewStep, reviewKeyAction, reviewPositionText,
+    // 見返しの分析（設計 §17）
+    ANALYSIS_VERSION, ANALYSIS_SPEEDS, ANALYSIS_MAIN, BAD_DROP, BLUNDER_DROP, EVAL_CAP, GRADE_NAMES,
+    analysisSpeed, analysisSig, parseAnalysis, cloneAnalysis, terminalEntry, startAnalysis, canResume,
+    analysisEntry, trapEntry, analysisProgress, entryValue, entryMater, moveJudgements, decisiveMove, analysisSummary,
+    trapCandidates, trapNext, trapBudget, trapCallMin, analysisMs, trapBudgetNodes, trapBudgetMs, analysisEstimateSec, formatDuration,
+    graphValue, analysisEvalText, analysisShortText, dropText, trapRest, mateLenText,
   };
 });
 </script>
@@ -44534,7 +46144,28 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     btnOverClose: $('btn-over-close'), btnOverCopy: $('btn-over-copy'), btnOverAgain: $('btn-over-again'),
     dlgKif: $('dlg-kif'), kifText: $('kif-text'), btnKifSelect: $('btn-kif-select'), btnKifClose: $('btn-kif-close'),
     toast: $('toast'), announce: $('announce'),
+    // 保存した棋譜（設計 §16）
+    btnSaved: $('btn-saved'), overSaved: $('over-saved'),
+    dlgSaved: $('dlg-saved'), savedTitle: $('dlg-saved-title'), savedInfo: $('saved-info'), savedNote: $('saved-note'),
+    savedList: $('saved-list'), btnSavedClose: $('btn-saved-close'),
+    dlgReview: $('dlg-review'), rvBoard: $('rv-board'), rvFiles: $('rv-files'), rvRanks: $('rv-ranks'),
+    rvHandTop: $('rv-hand-top'), rvHandBottom: $('rv-hand-bottom'), rvPlateTop: $('rv-plate-top'), rvPlateBottom: $('rv-plate-bottom'),
+    rvPosText: $('rv-pos-text'), rvCount: $('rv-count'), rvMeta: $('rv-meta'), rvMoves: $('rv-moves'), rvNote: $('rv-note'),
+    btnRvClose: $('btn-rv-close'), btnRvFirst: $('btn-rv-first'), btnRvPrev: $('btn-rv-prev'), btnRvNext: $('btn-rv-next'),
+    btnRvLast: $('btn-rv-last'), btnRvCopy: $('btn-rv-copy'), btnRvFlip: $('btn-rv-flip'), btnRvList: $('btn-rv-list'),
+    btnRvDelete: $('btn-rv-delete'),
+    dlgDel: $('dlg-del'), delText: $('del-text'), btnDelNo: $('btn-del-no'), btnDelYes: $('btn-del-yes'),
+    savedTrouble: $('saved-trouble'),
+    // 見返しの分析（設計 §17）
+    rvPosAn: $('rv-pos-an'), rvGraph: $('rv-graph'), rvGraphMsg: $('rv-graph-msg'), btnRvAn: $('btn-rv-an'),
+    rvAnStatus: $('rv-an-status'), rvAnLive: $('rv-an-live'), rvAnHere: $('rv-an-here'), rvAnSum: $('rv-an-sum'),
+    dlgAn: $('dlg-an'), formAn: $('form-an'), anSpeeds: $('an-speeds'), anNote: $('an-note'), btnAnCancel: $('btn-an-cancel'),
   };
+  // 保存した棋譜の画面の部品がそろっているか（そろっていなければ、その機能だけ出さない）
+  const HAS_ARCHIVE_UI = !!(el.btnSaved && el.dlgSaved && el.savedList && el.dlgReview && el.rvBoard && el.rvMoves && el.dlgDel);
+  // 見返しの分析の部品がそろっているか（そろっていなければ「分析」を出さない）
+  const HAS_ANALYSIS_UI = HAS_ARCHIVE_UI && !!(el.rvGraph && el.btnRvAn && el.rvAnStatus && el.rvAnHere && el.rvAnSum &&
+    el.dlgAn && el.formAn && el.anSpeeds && el.btnAnCancel) && typeof L.startAnalysis === 'function';
 
   /* ---------- 状態 ---------- */
 
@@ -44571,6 +46202,11 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     handSig: { top: '', bottom: '' },
     kifuSig: '',
     outeTimer: 0, toastTimer: 0,
+    // 保存した棋譜（設計 §16）
+    archive: { key: '', state: '' },   // 終局ごと（overShown と同じ鍵）の自動保存：'pending' | 'ok' | 'fail'
+    overCardKey: '',           // 終局の札を出した対局（overShown と同じ鍵）
+    aiPaused: false,           // 見返しを開いたので AI の読みを止めた（閉じたら読み直す）
+    delTarget: null,           // 削除を確かめている記録 { id, from:'list'|'review', index }
   };
 
   // Worker の状態。w＝主（go を受ける Worker）。並列の読み（設計 §15）のときは helpers に手伝いの Worker、smp に共有の表
@@ -45524,6 +47160,8 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     const key = S.game.moves().length + ':' + st.result;
     if (S.overShown === key) return;
     S.overShown = key;
+    // 終わった対局を「保存した棋譜」に入れる（終局ごとに1回。待ったで戻して指し直し、また終われば同じ対局を上書き。設計 §16）
+    archiveFinished(key);
     // 終局したら「投了しますか？」は意味がないので閉じる（閉じた後の焦点は盤へ）
     if (el.dlgResign.open) {
       el.dlgResign._opener = null;
@@ -45541,12 +47179,14 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
   };
 
   function showOver() {
-    // 新しい対局・棋譜のダイアログを開いている間は重ねない。閉じたときに出す。
-    if (el.dlgNew.open || el.dlgKif.open || el.dlgResign.open) {
+    // 新しい対局・棋譜・保存した棋譜のダイアログを開いている間は重ねない。閉じたときに出す。
+    if (el.dlgNew.open || el.dlgKif.open || el.dlgResign.open || archiveDialogOpen()) {
       S.overPending = S.overShown;
       return;
     }
     S.overPending = '';
+    S.overCardKey = S.overShown;
+    renderOverSaved();
     const st = S.game.status();
     const oc = L.outcomeFor(st, S.humanSide);
     el.overSeal.textContent = oc === 'win' ? '勝' : oc === 'loss' ? '負' : '分';
@@ -45709,7 +47349,11 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
   }
 
   function anyDialogOpen() {
-    return el.dlgNew.open || el.dlgResign.open || el.dlgOver.open || el.dlgKif.open;
+    return el.dlgNew.open || el.dlgResign.open || el.dlgOver.open || el.dlgKif.open || archiveDialogOpen();
+  }
+
+  function archiveDialogOpen() {
+    return HAS_ARCHIVE_UI && !!(el.dlgSaved.open || el.dlgReview.open || el.dlgDel.open || (HAS_ANALYSIS_UI && el.dlgAn.open));
   }
 
   // 焦点を戻せる要素か（無効・ページの外・ダイアログの中・body は不可）
@@ -45728,7 +47372,16 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
   function restoreFocus(d) {
     const o = d._opener;
     d._opener = null;
-    if (anyDialogOpen()) return;   // 次のダイアログに焦点がある
+    if (anyDialogOpen()) {
+      // 次のダイアログに焦点がある。ただし、下に開いているダイアログ（見返し・一覧）の中から開いたのなら、そこへ戻す
+      if (o && typeof o.focus === 'function' && !o.disabled && typeof o.closest === 'function') {
+        const host = o.closest('dialog');
+        if (host && host !== d && host.open) {
+          try { o.focus(); } catch (e) { /* 何もしない */ }
+        }
+      }
+      return;
+    }
     const target = usableFocus(o) ? o : boardCell();
     if (!target) return;
     if (target !== o) focusSquareCell(target);
@@ -45747,6 +47400,15 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     // 終局の札（モーダル）が開いている間は、外の知らせは札の下に隠れて読み上げもされないので札の中に出す
     if (el.dlgOver.open && el.overNote) {
       el.overNote.textContent = msg;
+      return;
+    }
+    // 保存した棋譜の見返し・一覧（モーダル）が開いている間も、その中に出す
+    if (HAS_ARCHIVE_UI && el.dlgReview.open && el.rvNote) {
+      el.rvNote.textContent = msg;
+      return;
+    }
+    if (HAS_ARCHIVE_UI && el.dlgSaved.open && el.savedNote) {
+      el.savedNote.textContent = msg;
       return;
     }
     el.toast.textContent = msg;
@@ -45777,7 +47439,12 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
       toast('棋譜を作れませんでした');
       return;
     }
-    const fallback = () => showKifFallback(kif);
+    copyText(kif, el.btnCopy);
+  }
+
+  // KIF の文字をクリップボードへ。書けなければ選択済みの欄を出す（opener は欄を閉じたときに焦点を戻す所）
+  function copyText(kif, opener) {
+    const fallback = () => showKifFallback(kif, opener);
     try {
       const cb = navigator.clipboard;
       if (cb && typeof cb.writeText === 'function') {
@@ -45788,13 +47455,14 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     fallback();
   }
 
-  function showKifFallback(kif) {
+  function showKifFallback(kif, opener) {
     if (el.dlgOver.open) {
       el.dlgOver._opener = null;
       closeDialog(el.dlgOver);
     }
     el.kifText.value = kif;
-    openDialog(el.dlgKif, el.btnCopy);
+    // 見返し・一覧の上に開いたときは、閉じるとその中（コピーのボタン）に戻る
+    openDialog(el.dlgKif, opener || el.btnCopy);
     selectKifText();
   }
 
@@ -45804,6 +47472,1719 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
       el.kifText.select();
       if (el.kifText.setSelectionRange) el.kifText.setSelectionRange(0, el.kifText.value.length);
     } catch (e) { /* 何もしない */ }
+  }
+
+  /* ---------- 保存した棋譜：置き場（設計 §16） ----------
+   * 終わった対局を、この端末のこのブラウザの中に残す。置き場は IndexedDB（データベース shogi-ai-kifu・入れ物 games・鍵 id）。
+   * IndexedDB が無い・開けない（3 秒で見切る）ときは localStorage（キー shogi-ai-kifu-v1。{ v:1, games:[…] }）。
+   * どちらも使えなければ保存しない（対局はそのまま遊べる。終局の札で短く知らせる）。今の対局の保存（shogi-ai-v1）とは別の置き場。
+   * 上限は ShogiUILogic.ARCHIVE_LIMIT（500局）。超えたら古いものから消す。壊れた記録は読み飛ばす（消さない）。
+   * 読み書きは1つずつ順に行う（AR.queue）。 */
+
+  const ARCHIVE_DB = 'shogi-ai-kifu';
+  const ARCHIVE_STORE = 'games';
+  const ARCHIVE_LS_KEY = 'shogi-ai-kifu-v1';
+  const ARCHIVE_OPEN_MS = 3000;     // IndexedDB を開くのを待つ上限
+  const ARCHIVE_OP_MS = 5000;       // IndexedDB の1回の読み書きを待つ上限
+  // localStorage に戻ったときの記録の文字数の上限（今の対局の保存 shogi-ai-v1 と同じ置き場を分け合うので、入りきらなくならないよう控えめに）
+  const ARCHIVE_LS_MAX_CHARS = 2000000;
+  const ARCHIVE_OPTS = { handicaps: HANDICAP_KEYS, limit: L.ARCHIVE_LIMIT };
+  const HANDICAP_NAMES = {};
+  for (const k of HANDICAP_KEYS) HANDICAP_NAMES[k] = (HANDICAPS[k] && HANDICAPS[k].name) || k;
+  const SUMMARY_OPTS = { levels: LEVELS, handicapNames: HANDICAP_NAMES };
+  const SAVE_OK_MSG = 'この対局は「保存した棋譜」に入れました。';
+  const SAVE_FAIL_MSG = '棋譜を保存できませんでした（このブラウザでは保存が使えないようです）。「棋譜をコピー」で写しておけます。';
+
+  // ready：置き場を決める約束（'idb' | 'ls' | 'none'）。cache：最後に読んだ一覧（新しい順）。
+  // trouble：IndexedDB はあるのに開けなかった・途中で読めなくなった（一時的なことがある。一覧で知らせ、一覧を開くたびに開き直す）。
+  // settled：ready の約束が決まった（開いている途中に、もう1つ開き始めないため）
+  const AR = { ready: null, kind: '', db: null, queue: Promise.resolve(), cache: [], ticket: 0, broken: 0, trouble: false, settled: true };
+
+  function archiveQueue(fn) {
+    const p = AR.queue.then(fn);
+    AR.queue = p.then(() => {}, () => {});
+    return p;
+  }
+
+  function lsStore() {
+    try { return window.localStorage || null; } catch (e) { return null; }
+  }
+
+  function lsUsable() {
+    const ls = lsStore();
+    if (!ls) return false;
+    try {
+      const k = ARCHIVE_LS_KEY + ':test';
+      ls.setItem(k, '1');
+      ls.removeItem(k);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // localStorage の入れ物を読む → { ok（読めた・入っていない）, games（中身。読めなければ []）, text（JSON として読めなかった中身） }
+  function lsLoad() {
+    const ls = lsStore();
+    if (!ls) return { ok: true, games: [], text: null };
+    let t = null;
+    try { t = ls.getItem(ARCHIVE_LS_KEY); } catch (e) { return { ok: false, games: [], text: null }; }
+    if (!t) return { ok: true, games: [], text: null };
+    try {
+      const o = JSON.parse(t);
+      if (o && typeof o === 'object' && !Array.isArray(o) && Array.isArray(o.games)) return { ok: true, games: o.games, text: null };
+    } catch (e) { /* 下で読めない中身として扱う */ }
+    return { ok: false, games: [], text: t };
+  }
+  function lsRead() {
+    return lsLoad().games;
+  }
+
+  // JSON として読めない中身は上書きせず、別のキー（…:unreadable）に取っておいてから空にする。取っておけなければ投げる（書かない）
+  function lsSetAside(text) {
+    const ls = lsStore();
+    if (!ls) throw new Error('localStorage が使えません');
+    let k = ARCHIVE_LS_KEY + ':unreadable';
+    try { if (ls.getItem(k) != null) k += '-' + Date.now(); } catch (e) { /* 下の書き込みで分かる */ }
+    ls.setItem(k, text);
+    ls.removeItem(ARCHIVE_LS_KEY);
+  }
+
+  // 書き直す前の中身 → { games（今の中身）, keep（読めない記録＝版が違う・形の壊れた物。書き直しても手を付けずに残す） }
+  function lsBase() {
+    const cur = lsLoad();
+    if (!cur.ok) {
+      if (cur.text == null) throw new Error('localStorage を読めません');
+      lsSetAside(cur.text);
+      return { games: [], keep: [] };
+    }
+    return { games: cur.games, keep: L.unreadableRows(cur.games, ARCHIVE_OPTS) };
+  }
+
+  // records（新しい順）を書く。keep（読めない記録）はそのまま後ろに残す（減らさない）。
+  // 文字数の上限を超える・入りきらないときは、まず古い記録の分析（設計 §17）から1割ずつ外し、それでも入らなければ
+  // keepId の1件は残して古い記録から1割ずつ減らす。その1件も入らなければ投げる。
+  // keepGames（分析の保存のとき）：対局の記録は減らさない。ほかの分析を外しても入らなければ、何も書かずに投げる（code 'no-room'）
+  function lsWrite(records, keepId, keep, keepGames) {
+    const ls = lsStore();
+    if (!ls) throw new Error('localStorage が使えません');
+    const extra = Array.isArray(keep) ? keep : [];
+    if (!records.length && !extra.length) { ls.removeItem(ARCHIVE_LS_KEY); return; }
+    let list = records.slice();
+    for (;;) {
+      let err = null;
+      const text = JSON.stringify({ v: 1, games: list.concat(extra) });
+      if (text.length > ARCHIVE_LS_MAX_CHARS) err = new Error('localStorage に入りきりません');
+      else {
+        try { ls.setItem(ARCHIVE_LS_KEY, text); return; } catch (e) { err = e; }
+      }
+      const withAn = list.filter((r) => r.analysis && r.id !== keepId);
+      if (withAn.length) {
+        const drop = Math.max(1, Math.ceil(withAn.length / 10));
+        const strip = new Set(withAn.slice(withAn.length - drop).map((r) => r.id));
+        list = list.map((r) => {
+          if (!strip.has(r.id)) return r;
+          const c = Object.assign({}, r);
+          delete c.analysis;
+          return c;
+        });
+        continue;
+      }
+      if (keepGames) {
+        const e = new Error('分析の結果が localStorage に入りきりません（棋譜は消していません）');
+        e.code = 'no-room';
+        throw e;
+      }
+      const others = list.filter((r) => r.id !== keepId);
+      if (!others.length) throw err;
+      const drop = Math.max(1, Math.ceil(others.length / 10));
+      const gone = new Set(others.slice(others.length - drop).map((r) => r.id));
+      list = list.filter((r) => !gone.has(r.id));
+    }
+  }
+
+  function lsPut(rec) {
+    const base = lsBase();
+    const n = L.addToArchive(base.games, rec, ARCHIVE_OPTS);
+    if (!n) throw new Error('保存する棋譜の形が正しくありません');
+    lsWrite(n.records, rec.id, base.keep);
+  }
+
+  // localStorage の記録1件に分析を入れる。その記録が無ければ false（消した記録を戻さない）。
+  // 作り直せる分析のために、作り直せない棋譜は消さない：入りきらなければ、ほかの記録の分析だけを外し、それでも入らなければ
+  // 何も書かずに投げる（呼ぶ側が「分析の結果を保存できませんでした（棋譜は消していません）」と出す）
+  function lsSetAnalysis(id, an) {
+    const base = lsBase();
+    const n = L.normalizeArchive(base.games, Object.assign({}, ARCHIVE_OPTS, { limit: Infinity }));
+    const rec = n.records.find((r) => r.id === id);
+    if (!rec) return false;
+    rec.analysis = an;
+    lsWrite(n.records, id, base.keep, true);
+    return true;
+  }
+
+  // 消す（消せなければ投げる）。読めない記録・読めない中身には触らない
+  function lsDeleteStrict(id) {
+    const cur = lsLoad();
+    if (!cur.ok) return;
+    const rows = cur.games;
+    const keep = rows.filter((r) => !(r && r.id === id));
+    if (keep.length === rows.length) return;
+    const ls = lsStore();
+    if (!ls) throw new Error('localStorage が使えません');
+    if (!keep.length) ls.removeItem(ARCHIVE_LS_KEY);
+    else ls.setItem(ARCHIVE_LS_KEY, JSON.stringify({ v: 1, games: keep }));
+  }
+  function lsDelete(id) {
+    try { lsDeleteStrict(id); } catch (e) { /* 消せなくても続ける */ }
+  }
+
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      let f = null;
+      try { f = window.indexedDB || null; } catch (e) { f = null; }
+      if (!f || typeof f.open !== 'function') { reject(new Error('IndexedDB がありません')); return; }
+      let done = false;
+      let timer = 0;
+      const settle = (db, err) => {
+        if (done) {
+          if (db) { try { db.close(); } catch (e) { /* 何もしない */ } }   // 見切った後に開けた分は閉じる
+          return;
+        }
+        done = true;
+        clearTimeout(timer);
+        if (db) resolve(db); else reject(err || new Error('IndexedDB を開けません'));
+      };
+      timer = setTimeout(() => settle(null, new Error('IndexedDB が開きません（時間切れ）')), ARCHIVE_OPEN_MS);
+      let req;
+      try { req = f.open(ARCHIVE_DB, 1); } catch (e) { settle(null, e); return; }
+      req.onupgradeneeded = () => {
+        try {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(ARCHIVE_STORE)) db.createObjectStore(ARCHIVE_STORE, { keyPath: 'id' });
+        } catch (e) { /* 作れなければ onerror が来る */ }
+      };
+      req.onsuccess = () => {
+        let db = null;
+        try { db = req.result; } catch (e) { db = null; }
+        if (!db || typeof db.transaction !== 'function') { settle(null, null); return; }
+        try {
+          // ほかのタブが版を上げるときは閉じて、次に使うときに開き直す
+          db.onversionchange = () => {
+            try { db.close(); } catch (e) { /* 何もしない */ }
+            if (AR.db === db) { AR.db = null; AR.ready = null; }
+          };
+        } catch (e) { /* 何もしない */ }
+        settle(db, null);
+      };
+      req.onerror = (e) => {
+        if (e && typeof e.preventDefault === 'function') e.preventDefault();
+        let err = null;
+        try { err = req.error; } catch (x) { err = null; }
+        settle(null, err);
+      };
+      // onblocked は待つ（時間切れで localStorage に戻る）
+    });
+  }
+
+  // IndexedDB の読み書きが返ってこないときに、後ろの読み書きまで止まらないよう、時間で見切る
+  function idbTimed(executor) {
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const timer = setTimeout(() => { if (!done) { done = true; reject(new Error('IndexedDB が返事をしません')); } }, ARCHIVE_OP_MS);
+      const ok = (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } };
+      const ng = (e) => { if (!done) { done = true; clearTimeout(timer); reject(e); } };
+      try { executor(ok, ng); } catch (e) { ng(e); }
+    });
+  }
+
+  function idbAll(db) {
+    return idbTimed((resolve, reject) => {
+      const tx = db.transaction(ARCHIVE_STORE, 'readonly');
+      tx.onabort = () => reject(tx.error || new Error('IndexedDB を読めませんでした'));
+      const store = tx.objectStore(ARCHIVE_STORE);
+      if (typeof store.getAll !== 'function') throw new Error('getAll がありません');
+      const req = store.getAll();
+      req.onsuccess = () => resolve(Array.isArray(req.result) ? req.result : []);
+      req.onerror = (e) => {
+        if (e && typeof e.preventDefault === 'function') e.preventDefault();
+        reject(req.error || new Error('IndexedDB を読めません'));
+      };
+    });
+  }
+
+  function idbWrite(db, puts, dels) {
+    return idbTimed((resolve, reject) => {
+      const tx = db.transaction(ARCHIVE_STORE, 'readwrite');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error('IndexedDB に書けません'));
+      tx.onabort = () => reject(tx.error || new Error('IndexedDB に書けませんでした'));
+      try {
+        const store = tx.objectStore(ARCHIVE_STORE);
+        for (const r of puts) store.put(r);
+        for (const id of dels) store.delete(id);
+      } catch (e) {
+        try { tx.abort(); } catch (x) { /* 何もしない */ }
+        reject(e);
+      }
+    });
+  }
+
+  // localStorage に残っている記録（IndexedDB が使えなかったときの分）を IndexedDB へ移す。移せたら localStorage から消す。
+  // 読めない記録（版が違う・形の壊れた物）は移さずに localStorage に残す。JSON として読めない中身には触らない
+  function idbMigrate(db) {
+    const cur = lsLoad();
+    if (!cur.ok) return Promise.resolve();
+    const rows = cur.games;
+    const keep = L.unreadableRows(rows, ARCHIVE_OPTS);
+    if (keep.length === rows.length) return Promise.resolve();
+    return idbAll(db).then((have) => {
+      const plan = L.mergeArchive(have, rows, ARCHIVE_OPTS);
+      return idbWrite(db, plan.puts, plan.removed);
+    }).then(() => {
+      const ls = lsStore();
+      if (!ls) return;
+      if (keep.length) ls.setItem(ARCHIVE_LS_KEY, JSON.stringify({ v: 1, games: keep }));
+      else ls.removeItem(ARCHIVE_LS_KEY);
+    });
+  }
+
+  function idbExists() {
+    try {
+      const f = window.indexedDB;
+      return !!f && typeof f.open === 'function';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // 置き場を決める（最初に使うときに1回。IndexedDB を開けなかったときは、一覧を開くたびに開き直す：archiveRetry）
+  function archiveBackend() {
+    if (!AR.ready) {
+      AR.settled = false;
+      AR.ready = idbOpen().then((db) => {
+        AR.db = db;
+        AR.kind = 'idb';
+        AR.trouble = false;
+        AR.settled = true;
+        return idbMigrate(db).then(() => 'idb', () => 'idb');
+      }, () => {
+        AR.db = null;
+        AR.kind = lsUsable() ? 'ls' : 'none';
+        AR.trouble = idbExists();   // IndexedDB はあるのに開けなかった（ほかのタブ・端末の混み具合などで一時的なことがある）
+        AR.settled = true;
+        return AR.kind;
+      });
+    }
+    return AR.ready;
+  }
+
+  // IndexedDB が途中で読めなくなった → この後は localStorage（それも使えなければ保存しない）。一覧を開くたびに開き直す
+  function archiveDropIdb() {
+    try { if (AR.db) AR.db.close(); } catch (e) { /* 何もしない */ }
+    AR.db = null;
+    AR.kind = lsUsable() ? 'ls' : 'none';
+    AR.trouble = true;
+    AR.settled = true;
+    AR.ready = Promise.resolve(AR.kind);
+  }
+
+  // 一覧を開くとき：前に IndexedDB をうまく開けなかった・読めなくなったなら、もう一度開いてみる（開いている途中なら待つ）
+  function archiveRetry() {
+    if (AR.trouble && AR.kind !== 'idb' && AR.settled) AR.ready = null;
+  }
+
+  // 一覧を読む → { records（新しい順）, removed, broken }
+  function archiveList() {
+    return archiveQueue(() => archiveBackend().then((kind) => {
+      if (kind === 'idb' && AR.db) {
+        // IndexedDB に書けなかった記録が localStorage に入っていることがあるので、合わせて見せる
+        return idbAll(AR.db).then((rows) => rows.concat(lsRead()), () => { archiveDropIdb(); return lsRead(); });
+      }
+      return AR.kind === 'ls' ? lsRead() : [];
+    })).then((rows) => {
+      const n = L.normalizeArchive(rows, ARCHIVE_OPTS);
+      AR.cache = n.records;
+      AR.broken = n.broken;
+      return n;
+    });
+  }
+
+  // 1件を入れる（同じ名札は置き換え）。IndexedDB に書けなければ localStorage へ
+  function archivePut(rec) {
+    return archiveQueue(() => archiveBackend().then((kind) => {
+      if (kind === 'idb' && AR.db) {
+        const db = AR.db;
+        return idbAll(db).then((rows) => {
+          const n = L.addToArchive(rows, rec, ARCHIVE_OPTS);
+          if (!n) throw new Error('保存する棋譜の形が正しくありません');
+          return idbWrite(db, [rec], n.removed);
+        }).then(() => lsDelete(rec.id), () => lsPut(rec));
+      }
+      if (AR.kind === 'ls') return lsPut(rec);
+      throw new Error('この端末では保存できません');
+    }));
+  }
+
+  function archiveRemove(id) {
+    return archiveQueue(() => archiveBackend().then((kind) => {
+      if (kind === 'idb' && AR.db) return idbWrite(AR.db, [], [id]).then(() => lsDelete(id));
+      if (AR.kind === 'ls') return lsDeleteStrict(id);
+      throw new Error('この端末では保存が使えません');
+    })).then(() => {
+      AR.cache = AR.cache.filter((r) => r.id !== id);
+    });
+  }
+
+  // 記録1件に分析の結果を入れる（設計 §17）→ true（入れた）｜false（その記録がもう無い＝消した記録を戻さない）。書けなければ失敗
+  function archiveSaveAnalysis(id, an) {
+    return archiveQueue(() => archiveBackend().then((kind) => {
+      if (kind === 'idb' && AR.db) {
+        const db = AR.db;
+        return idbAll(db).then((rows) => {
+          const raw = rows.find((r) => r && typeof r === 'object' && r.id === id);
+          // IndexedDB に書けなかった記録は localStorage に入っている
+          if (!raw || !L.parseGameRecord(raw, ARCHIVE_OPTS)) return lsSetAnalysis(id, an);
+          return idbWrite(db, [Object.assign({}, raw, { analysis: an })], []).then(() => true);
+        });
+      }
+      if (AR.kind === 'ls') return lsSetAnalysis(id, an);
+      throw new Error('この端末では保存できません');
+    }));
+  }
+
+  /* ---------- 保存した棋譜：終局で自動保存 ---------- */
+
+  function archiveFinished(key) {
+    if (!HAS_ARCHIVE_UI) return;
+    S.archive = { key, state: 'pending' };
+    let rec = null;
+    try {
+      let kif = null;
+      try { kif = buildKif(); } catch (e) { kif = null; }
+      rec = L.buildGameRecord({
+        startSfen: S.game.startSfen, moves: S.game.moves(), humanSide: S.humanSide,
+        level: S.level, levelName: L.levelName(LEVELS, S.level),
+        handicap: S.handicap, handicapName: HANDICAP_NAMES[S.handicap] || S.handicap,
+        status: S.game.status(),
+        resigned: typeof S.game.resigned === 'function' ? S.game.resigned() : resignedSide(),
+        startedAt: S.startedAt, endedAt: Date.now(), kif,
+      }, ARCHIVE_OPTS);
+    } catch (e) {
+      rec = null;
+    }
+    if (!rec) { archiveDone(key, false); return; }
+    let p;
+    try { p = archivePut(rec); } catch (e) { archiveDone(key, false); return; }
+    p.then(() => archiveDone(key, true), () => archiveDone(key, false));
+  }
+
+  function archiveDone(key, ok) {
+    if (S.archive.key !== key) return;   // 待ったなどで別の終局になった
+    S.archive.state = ok ? 'ok' : 'fail';
+    renderOverSaved();
+    if (el.dlgSaved.open) refreshSaved();
+    // 終局の札をもう閉じていたら、外の知らせで伝える（札がこれから開くなら札の中に出る）
+    if (!ok && S.overCardKey === key && !el.dlgOver.open) toast(SAVE_FAIL_MSG);
+  }
+
+  function renderOverSaved() {
+    if (!el.overSaved) return;
+    const a = S.archive;
+    let t = '';
+    if (a && a.key && a.key === S.overShown) t = a.state === 'ok' ? SAVE_OK_MSG : a.state === 'fail' ? SAVE_FAIL_MSG : '';
+    if (el.overSaved.textContent !== t) el.overSaved.textContent = t;
+  }
+
+  /* ---------- 保存した棋譜：一覧 ---------- */
+
+  function findRecord(id) {
+    return AR.cache.find((r) => r.id === id) || null;
+  }
+
+  function openSaved(opener, note) {
+    if (S.promo) closePromo();
+    if (S.sel) { S.sel = null; render(); }
+    el.savedNote.textContent = note || '';
+    renderSavedLoading();
+    openDialog(el.dlgSaved, opener || el.btnSaved);
+    archiveRetry();
+    refreshSaved(null);
+  }
+
+  // 読み直して描く。focus：{ index } なら描いた後にその行（無ければ前の行・「閉じる」）へ焦点
+  function refreshSaved(focus) {
+    const t = ++AR.ticket;
+    archiveList().then((n) => {
+      if (t === AR.ticket && el.dlgSaved.open) renderSavedList(n.records, focus);
+    }, () => {
+      if (t === AR.ticket && el.dlgSaved.open) renderSavedList([], focus);
+    });
+  }
+
+  function renderSavedLoading() {
+    el.savedList.textContent = '';
+    const li = doc.createElement('li');
+    li.className = 'saved-empty';
+    li.textContent = '読み込んでいます…';
+    el.savedList.appendChild(li);
+  }
+
+  function renderSavedInfo() {
+    // IndexedDB はあるのに今回は開けなかった：前の棋譜は消えていないことを一行で知らせる
+    if (el.savedTrouble) el.savedTrouble.hidden = !AR.trouble;
+    if (AR.kind === 'none') {
+      el.savedInfo.textContent = 'このブラウザでは棋譜を保存できません（プライベートブラウズや、サイトのデータを残さない設定など）。対局はそのまま遊べます。';
+      el.savedInfo.className = 'saved-info is-warn';
+      return;
+    }
+    let t = '終わった対局は自動でここに入ります。この端末のこのブラウザの中にだけ保存しています（ブラウザのデータを消すと消えます）。' +
+      L.ARCHIVE_LIMIT + '局を超えたら古いものから消えます。';
+    if (AR.broken > 0) t += '読めない記録が ' + AR.broken + ' 件あったので、飛ばしました。';
+    el.savedInfo.textContent = t;
+    el.savedInfo.className = 'saved-info';
+  }
+
+  function renderSavedList(records, focus) {
+    const list = el.savedList;
+    // 描き直しで焦点が消えないよう、一覧の中に焦点があれば同じ行の同じボタンへ戻す（無くなっていれば「閉じる」）
+    let keep = null;
+    const ae = doc.activeElement;
+    if (!focus && ae && typeof ae.closest === 'function' && ae.closest('.saved-list')) {
+      keep = { id: ae.getAttribute('data-id'), act: ae.getAttribute('data-act') };
+    }
+    list.textContent = '';
+    el.savedTitle.textContent = '保存した棋譜' + (records.length ? '（' + records.length + '局）' : '');
+    renderSavedInfo();
+    if (!records.length) {
+      const li = doc.createElement('li');
+      li.className = 'saved-empty';
+      li.textContent = 'まだありません。終わった対局は自動でここに入ります。';
+      list.appendChild(li);
+    }
+    const opens = [];
+    for (const rec of records) {
+      const s = L.recordSummary(rec, SUMMARY_OPTS);
+      const li = doc.createElement('li');
+      li.className = 'saved-item';
+      li.setAttribute('data-id', rec.id);
+
+      const open = doc.createElement('button');
+      open.type = 'button';
+      open.className = 'saved-open';
+      open.id = 'saved-open-' + rec.id;
+      open.setAttribute('data-act', 'open');
+      open.setAttribute('data-id', rec.id);
+      open.setAttribute('aria-label', s.label + '見返す');
+      const badge = doc.createElement('span');
+      badge.className = 'saved-badge is-' + rec.outcome;
+      badge.setAttribute('aria-hidden', 'true');
+      badge.textContent = s.mark;
+      const text = doc.createElement('span');
+      text.className = 'saved-text';
+      text.appendChild(span('saved-date', s.line1));
+      text.appendChild(span('saved-sub', s.line2));
+      text.appendChild(span('saved-sub', s.line3));
+      open.appendChild(badge);
+      open.appendChild(text);
+
+      const acts = doc.createElement('span');
+      acts.className = 'saved-acts';
+      const copy = doc.createElement('button');
+      copy.type = 'button';
+      copy.className = 'btn-quiet';
+      copy.id = 'saved-copy-' + rec.id;
+      copy.setAttribute('data-act', 'copy');
+      copy.setAttribute('data-id', rec.id);
+      copy.setAttribute('aria-label', s.date + ' の棋譜をコピー');
+      copy.textContent = 'コピー';
+      const del = doc.createElement('button');
+      del.type = 'button';
+      del.className = 'btn-quiet saved-del';
+      del.id = 'saved-del-' + rec.id;
+      del.setAttribute('data-act', 'delete');
+      del.setAttribute('data-id', rec.id);
+      del.setAttribute('aria-label', s.date + ' の棋譜を削除');
+      del.textContent = '削除';
+      acts.appendChild(copy);
+      acts.appendChild(del);
+
+      li.appendChild(open);
+      li.appendChild(acts);
+      list.appendChild(li);
+      opens.push(open);
+    }
+    let target = null;
+    if (focus && Number.isInteger(focus.index)) {
+      target = opens.length ? opens[Math.min(focus.index, opens.length - 1)] : el.btnSavedClose;
+    } else if (keep) {
+      const kind = keep.act === 'copy' ? 'copy' : keep.act === 'delete' ? 'del' : 'open';
+      target = (keep.id && $('saved-' + kind + '-' + keep.id)) || el.btnSavedClose;
+    }
+    if (target) {
+      try { target.focus(); } catch (e) { /* 何もしない */ }
+    }
+  }
+
+  // その記録の KIF（保存した文字。無ければ指し手から作り直す）
+  function kifForRecord(rec) {
+    if (rec.kif) return rec.kif;
+    const rv = L.buildReview(Core, rec);
+    if (!rv) return null;
+    const ai = '将棋AI（' + (rec.levelName || L.levelName(LEVELS, rec.level)) + '）';
+    try {
+      return rv.game.toKIF({
+        sente: rec.humanSide === 'b' ? 'あなた' : ai,
+        gote: rec.humanSide === 'w' ? 'あなた' : ai,
+        date: new Date(rec.startedAt),
+      });
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function copyRecord(rec, opener) {
+    const kif = rec ? kifForRecord(rec) : null;
+    if (!kif) { toast('棋譜を作れませんでした'); return; }
+    copyText(kif, opener);
+  }
+
+  /* ---------- 保存した棋譜：削除（ページ内で確かめてから） ---------- */
+
+  function askDelete(id, from, opener) {
+    const rec = findRecord(id);
+    if (!rec) return;
+    const s = L.recordSummary(rec, SUMMARY_OPTS);
+    el.delText.textContent = s.date + ' の対局（' + s.handicap + '・あなた' + s.side + '・相手 ' + s.opponent + '・' +
+      s.plies + '・' + s.outcomeText + '）';
+    S.delTarget = { id, from, index: AR.cache.indexOf(rec) };
+    openDialog(el.dlgDel, opener);
+    try { el.btnDelNo.focus(); } catch (e) { /* 何もしない */ }
+  }
+
+  function doDelete() {
+    const t = S.delTarget;
+    S.delTarget = null;
+    el.dlgDel._opener = null;
+    closeDialog(el.dlgDel);
+    if (!t) return;
+    archiveRemove(t.id).then(() => {
+      if (t.from === 'review' && el.dlgReview.open) {
+        // 見返していた棋譜を消した → 一覧へ戻る
+        el.dlgReview._opener = null;
+        closeDialog(el.dlgReview);
+        openSaved(el.btnSaved, '棋譜を削除しました');
+        return;
+      }
+      if (el.dlgSaved.open) {
+        el.savedNote.textContent = '棋譜を削除しました';
+        refreshSaved({ index: Math.max(0, t.index) });
+      }
+    }, () => {
+      toast('棋譜を削除できませんでした');
+    });
+  }
+
+  /* ---------- 保存した棋譜：見返し ----------
+   * 今の対局とは別の Game（ShogiUILogic.buildReview）で、各手数の局面を先に作っておき、盤と駒台を描く。
+   * 見返している間は AI は考えない（考え中なら止め、閉じたら読み直す）。今の対局の盤・保存には触らない。 */
+
+  const RV = { rec: null, rv: null, index: 0, flip: false, cells: [], filesFlip: null, handSig: { top: '', bottom: '' }, moveBtns: [], cur: -1 };
+
+  function buildReviewBoard() {
+    el.rvBoard.textContent = '';
+    RV.cells = [];
+    for (let i = 0; i < 81; i++) {
+      const c = doc.createElement('span');
+      c.className = 'sq';
+      c.setAttribute('role', 'img');
+      const pc = doc.createElement('span');
+      pc.className = 'pc';
+      pc.hidden = true;
+      pc.setAttribute('aria-hidden', 'true');
+      c.appendChild(pc);
+      el.rvBoard.appendChild(c);
+      RV.cells.push({ el: c, pc, key: null, label: '' });
+    }
+    el.rvFiles.textContent = '';
+    el.rvRanks.textContent = '';
+    for (let i = 0; i < 9; i++) {
+      el.rvFiles.appendChild(doc.createElement('span'));
+      el.rvRanks.appendChild(doc.createElement('span'));
+    }
+  }
+
+  function openReview(id) {
+    const rec = findRecord(id);
+    if (!rec) { el.savedNote.textContent = 'この棋譜は見つかりませんでした。'; return; }
+    const rv = L.buildReview(Core, rec);
+    if (!rv) { el.savedNote.textContent = 'この棋譜は読めませんでした（指し手が規則に合いません）。削除はできます。'; return; }
+    RV.rec = rec;
+    RV.rv = rv;
+    RV.index = 0;
+    RV.flip = false;
+    RV.filesFlip = null;
+    RV.handSig = { top: '', bottom: '' };
+    for (const c of RV.cells) { c.key = null; c.label = ''; }
+    // 見返している間は AI に考えさせない（今の対局はそのまま。閉じたら読み直す）
+    if (S.thinking) {
+      stopThinking();
+      S.aiPaused = true;
+      render();
+    }
+    buildReviewMoves();
+    el.rvNote.textContent = '';
+    anOpenReview();
+    renderReview();
+    if (el.dlgSaved.open) {
+      el.dlgSaved._opener = null;
+      closeDialog(el.dlgSaved);
+    }
+    openDialog(el.dlgReview, el.btnSaved);
+    // 開いてから大きさが決まるので、グラフを描き直す（大きさが変わっていれば）
+    if (HAS_ANALYSIS_UI) renderAnalysis();
+    try { el.btnRvNext.focus(); } catch (e) { /* 何もしない */ }
+  }
+
+  // 見返しを閉じた：止めていた AI の読みを始め直す
+  function resumeAfterReview() {
+    if (!S.aiPaused || el.dlgReview.open) return;
+    S.aiPaused = false;
+    if (!S.thinking && !S.game.status().over && S.game.position().turn !== S.humanSide) think();
+  }
+
+  function reviewGo(action) {
+    if (!RV.rv) return;
+    const n = RV.rv.positions.length - 1;
+    const i = L.reviewStep(RV.index, action, n);
+    if (i === RV.index) return;
+    RV.index = i;
+    renderReview();
+  }
+
+  function buildReviewMoves() {
+    const list = el.rvMoves;
+    const rv = RV.rv;
+    list.textContent = '';
+    RV.moveBtns = [];
+    RV.cur = -1;
+    const startTurn = L.sfenTurn(RV.rec.startSfen);
+    const add = (i, no, mk, mv, label) => {
+      const li = doc.createElement('li');
+      const b = doc.createElement('button');
+      b.type = 'button';
+      b.className = 'rv-mv';
+      b.setAttribute('data-i', String(i));
+      b.setAttribute('aria-label', label);
+      b.setAttribute('data-label', label);
+      b.appendChild(span('k-no', no));
+      b.appendChild(span('k-mk', mk));
+      b.appendChild(span('k-mv', mv));
+      // 分析の印（悪手・大悪手・詰み筋。設計 §17）。分析が無ければ空
+      if (i > 0) { const m = span('k-an', ''); m.setAttribute('aria-hidden', 'true'); b.appendChild(m); }
+      li.appendChild(b);
+      list.appendChild(li);
+      RV.moveBtns.push(b);
+    };
+    add(0, '', '', '開始局面', '開始局面');
+    rv.records.forEach((rec, i) => {
+      const jp = String(rec.jp || '');
+      let mk = jp.charAt(0), mv = jp.slice(1);
+      if (mk !== '▲' && mk !== '△') {
+        mk = L.sideOfPly(startTurn, i) === 'b' ? '▲' : '△';
+        mv = jp;
+      }
+      add(i + 1, String(rec.ply || i + 1), mk, mv, (i + 1) + '手目 ' + mk + mv);
+    });
+    const st = rv.status;
+    if (st && st.over) {
+      if (st.result === 'resign') {
+        // 手番の側の投了だけ手数を付ける（対局の棋譜の欄・KIF と同じ）
+        const n = rv.positions.length - 1;
+        const who = rv.resigned;
+        const onTurn = who === rv.positions[n].turn;
+        const li = doc.createElement('li');
+        li.className = 'rv-line';
+        li.appendChild(span('k-no', onTurn ? String(n + 1) : ''));
+        li.appendChild(span('k-mk', who === 'b' ? '▲' : who === 'w' ? '△' : ''));
+        li.appendChild(span('k-mv', '投了'));
+        list.appendChild(li);
+      }
+      const end = doc.createElement('li');
+      end.className = 'rv-line k-end';
+      end.appendChild(span('k-no', ''));
+      end.appendChild(span('k-mv', st.text || '終局'));
+      list.appendChild(end);
+    }
+  }
+
+  function setStepState(btn, off) {
+    btn.setAttribute('aria-disabled', off ? 'true' : 'false');
+  }
+
+  function renderReview() {
+    const rec = RV.rec, rv = RV.rv;
+    if (!rec || !rv) return;
+    const n = rv.positions.length - 1;
+    const p = rv.positions[RV.index];
+    const fl = (rec.humanSide === 'w') !== RV.flip;
+    const bottom = fl ? 'w' : 'b';
+    const handi = rec.handicap !== 'hirate';
+    const last = p.lastMove ? L.parseUsi(p.lastMove) : null;
+    let checkSq = null;
+    if (p.inCheck) {
+      const king = p.turn === 'b' ? 'K' : 'k';
+      for (let r = 0; r < 9 && !checkSq; r++) {
+        for (let c = 0; c < 9; c++) {
+          if (p.board[r][c] === king) { checkSq = L.rcToSquare(r, c); break; }
+        }
+      }
+    }
+    if (RV.filesFlip !== fl) {
+      const fs = L.fileLabels(fl), rs = L.rankLabels(fl);
+      for (let i = 0; i < 9; i++) {
+        el.rvFiles.children[i].textContent = fs[i];
+        el.rvRanks.children[i].textContent = rs[i];
+      }
+      RV.filesFlip = fl;
+    }
+    for (let i = 0; i < 81; i++) {
+      const vr = (i / 9) | 0, vc = i % 9;
+      const rc = L.viewToRC(vr, vc, fl);
+      const sq = L.rcToSquare(rc.row, rc.col);
+      const code = p.board[rc.row][rc.col] || '';
+      const rev = !!code && L.pieceOwner(code) !== bottom;
+      const cell = RV.cells[i];
+      const key = code + (rev ? '~' : '');
+      if (cell.key !== key) { paintPiece(cell.pc, code, rev); cell.key = key; }
+      const isLast = !!last && (last.to === sq || last.from === sq);
+      cell.el.classList.toggle('is-last', isLast);
+      cell.el.classList.toggle('is-check', sq === checkSq);
+      const note = sq === checkSq ? '王手されています' : isLast ? '直前の手' : '';
+      const label = L.squareAria(sq, code, handi, note);
+      if (cell.label !== label) { cell.el.setAttribute('aria-label', label); cell.label = label; }
+    }
+    const topSide = fl ? 'b' : 'w';
+    renderReviewStand('top', el.rvHandTop, el.rvPlateTop, topSide, p, true);
+    renderReviewStand('bottom', el.rvHandBottom, el.rvPlateBottom, L.opposite(topSide), p, false);
+
+    const pt = L.reviewPositionText(rv, RV.index);
+    el.rvPosText.textContent = pt.text;
+    el.rvCount.textContent = pt.count;
+    setStepState(el.btnRvFirst, RV.index === 0);
+    setStepState(el.btnRvPrev, RV.index === 0);
+    setStepState(el.btnRvNext, RV.index === n);
+    setStepState(el.btnRvLast, RV.index === n);
+
+    if (RV.cur !== RV.index) {
+      const old = RV.moveBtns[RV.cur];
+      if (old) { old.classList.remove('is-cur'); old.removeAttribute('aria-current'); }
+      const now = RV.moveBtns[RV.index];
+      if (now) {
+        now.classList.add('is-cur');
+        now.setAttribute('aria-current', 'step');
+        scrollMoveIntoView(now);
+      }
+      RV.cur = RV.index;
+    }
+
+    const s = L.recordSummary(rec, SUMMARY_OPTS);
+    el.rvMeta.textContent = s.date + ' の対局 · ' + s.handicap + ' · あなた' + s.side + ' · 相手 ' + s.opponent + ' · ' +
+      s.outcomeText + '（' + ((rv.status && rv.status.text) || rec.endText) + '）';
+    renderAnalysis();
+  }
+
+  // 指し手の一覧の中だけを動かして、今の手を見える所に置く（画面全体は動かさない。盤が上へ消えないように）
+  function scrollMoveIntoView(btn) {
+    const list = el.rvMoves;
+    const li = btn.parentNode;
+    if (!li || typeof li.offsetTop !== 'number' || typeof list.clientHeight !== 'number' || !list.clientHeight) return;
+    const top = li.offsetTop, bottom = top + (li.offsetHeight || 0);
+    if (top < list.scrollTop) list.scrollTop = top;
+    else if (bottom > list.scrollTop + list.clientHeight) list.scrollTop = bottom - list.clientHeight;
+  }
+
+  function renderReviewStand(slot, box, plate, side, p, rev) {
+    const rec = RV.rec;
+    const hand = (p.hands && p.hands[side]) || {};
+    const mine = side === rec.humanSide;
+    const sig = [rec.id, side, rev ? 1 : 0].concat(L.HAND_ORDER.map((k) => hand[k] || 0)).join(',');
+    if (RV.handSig[slot] === sig) return;
+    RV.handSig[slot] = sig;
+    const handi = rec.handicap !== 'hirate';
+    plate.textContent = '';
+    plate.appendChild(span('pl-mark', (side === 'b' ? '▲' : '△') + L.sideName(side, handi)));
+    plate.appendChild(span('pl-name', mine ? 'あなた' : 'AI'));
+    if (!mine) plate.appendChild(span('pl-sub', 'Lv' + rec.level + ' ' + (rec.levelName || L.levelName(LEVELS, rec.level))));
+    box.textContent = '';
+    const parts = [];
+    for (const k of L.HAND_ORDER) {
+      const n = hand[k] || 0;
+      if (n <= 0) continue;
+      const name = L.pieceLabel(k);
+      parts.push(name + n);
+      const item = doc.createElement('span');
+      item.className = 'hand-btn';
+      item.setAttribute('aria-hidden', 'true');
+      item.appendChild(makePiece(side === 'b' ? k : k.toLowerCase(), rev));
+      if (n > 1) item.appendChild(span('cnt', String(n)));
+      box.appendChild(item);
+    }
+    if (!parts.length) {
+      const empty = span('komadai-empty', '持ち駒なし');
+      empty.setAttribute('aria-hidden', 'true');
+      box.appendChild(empty);
+    }
+    box.setAttribute('role', 'group');
+    box.setAttribute('aria-label', (mine ? 'あなた' : 'AI') + 'の持ち駒' + (parts.length ? '：' + parts.join('、') : '：なし'));
+  }
+
+  /* ---------- 見返しの分析（設計 §17） ----------
+   * 「分析」を押すと、1局面に読む時間（速い 0.3秒・ふつう 1秒・じっくり 3秒）を選んで始める。分析専用の Worker
+   * （engine/analyze_worker.js。対局の Worker とは別）に1局面ずつ読ませ、読み終わった局面から形勢のグラフを描く。
+   * 全部の局面を読んだら、負けた側の手から、点数が大きく動いた手と終盤の手の順に「その手で詰み筋に入ったか」を予算の範囲で調べる
+   * （予算は読む局面の数。時計の時間で切らないので、遅い端末でも調べる量は同じ）。
+   * 分析の間も進め戻しができ、「止める」でいつでも止められる。見返しを閉じても止める。
+   * 結果はその棋譜の記録（analysis 欄）に入れる（止めたときもそこまでの分。同じ時間で始めれば続きから）。
+   * Worker が使えないときは本体で1つずつ読む（1局面 0.5 秒まで・1つごとに画面へ返す）。 */
+
+  // 分析の Worker の中で読む順：core → 詰み探索 → 評価の重み → 評価のウェブアセンブリ → 学習した評価 → search → 分析
+  // （定跡と並列の読みは使わない。evalkp_wasm は evalkp の直前）
+  const ANALYZE_PARTS = ['src-core', 'src-mate', 'src-weights', 'src-evalkp-wasm', 'src-evalkp', 'src-search', 'src-analyze-worker'];
+  const AN_SILENT_MS = 10000;   // 分析の Worker の最初の返事を待つ上限（重い部品を読むので長め）
+  const AN_SAVE_EVERY = 20;     // 途中の結果を記録に入れる間（読んだ局面・調べた手の数）
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+
+  const AN = {
+    run: false, rec: null, data: null, speed: 'normal', main: false, broken: false,
+    w: null, url: '', spoke: false, dog: 0, id: 0, job: null, timer: 0, phase: '',
+    trapList: null, trapLeft: 0, unsaved: 0, ver: 0,
+    msg: '', saveNote: '', bucket: '', judg: [null], sum: null,
+    hereKey: '', sumKey: '', marksKey: '', speedInputs: [], mainLoaded: false,
+  };
+  const G = { svg: null, mid: null, area: null, line: null, marks: null, cur: null, top: null, bot: null, key: '' };
+
+  // いま見せる分析（分析中ならその途中、そうでなければ記録に入っている物）
+  function anView() {
+    if (!RV.rec) return null;
+    if (AN.data && AN.rec === RV.rec) return AN.data;
+    return RV.rec.analysis || null;
+  }
+
+  // 手ごとの判定とまとめを計算し直す（結果が届くたび・開いたとき）
+  function anDerive() {
+    const a = anView(), rec = RV.rec;
+    AN.judg = a && rec ? L.moveJudgements(a, rec) : [null];
+    AN.sum = a && rec ? L.analysisSummary(a, rec, AN.judg) : null;
+    AN.ver++;
+  }
+
+  function anOpenReview() {
+    if (!HAS_ANALYSIS_UI) return;
+    if (AN.run && AN.rec !== RV.rec) anStop();   // 前の見返しの分析が残っていれば止める（閉じたときに止めているはず）
+    AN.msg = '';
+    AN.saveNote = '';
+    AN.bucket = '';
+    AN.hereKey = '';
+    AN.sumKey = '';
+    AN.marksKey = '';
+    G.key = '';
+    anDerive();
+  }
+
+  /* -- 読む係（Worker・本体） -- */
+
+  function anWorkerPossible() {
+    return !AN.broken && typeof Worker === 'function' && typeof Blob === 'function' &&
+      typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function';
+  }
+  function anRevoke() {
+    if (AN.url) {
+      try { URL.revokeObjectURL(AN.url); } catch (e) { /* 何もしない */ }
+      AN.url = '';
+    }
+  }
+  function anKillWorker() {
+    clearTimeout(AN.dog);
+    if (AN.w) {
+      try { AN.w.terminate(); } catch (e) { /* 何もしない */ }
+      AN.w = null;
+    }
+    anRevoke();
+    AN.spoke = false;
+  }
+  function anWorker() {
+    if (AN.w) return AN.w;
+    if (!anWorkerPossible()) return null;
+    try {
+      const part = $('src-analyze-worker');
+      if (!part || !part.textContent.trim()) throw new Error('分析の部品がありません');
+      AN.url = URL.createObjectURL(new Blob([workerSource(ANALYZE_PARTS)], { type: 'text/javascript' }));
+      const w = new Worker(AN.url);
+      AN.spoke = false;
+      w.onmessage = (e) => anOnMessage(w, e && e.data);
+      w.onerror = (e) => anOnError(w, e);
+      AN.w = w;
+      return w;
+    } catch (e) {
+      AN.broken = true;
+      anRevoke();
+      return null;
+    }
+  }
+  function anOnMessage(w, d) {
+    if (w !== AN.w) return;
+    if (!AN.spoke) { AN.spoke = true; clearTimeout(AN.dog); anRevoke(); }
+    if (!d || typeof d !== 'object' || !AN.run || !AN.job || d.id !== AN.job.id) return;
+    if (d.type === 'error') { anFail(String(d.message || '原因不明')); return; }
+    if (d.type === AN.job.type) anResult(AN.job, d);
+  }
+  function anOnError(w, e) {
+    if (w !== AN.w) return;
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+    const early = !AN.spoke;
+    anKillWorker();
+    if (!AN.run) return;
+    if (early) { AN.broken = true; anSwitchMain(); }   // 最初の返事の前に落ちた → この環境では本体で読む
+    else anFail((e && e.message) || '分析の Worker が止まりました');
+  }
+  function anArmDog() {
+    clearTimeout(AN.dog);
+    if (AN.spoke) return;
+    AN.dog = setTimeout(() => {
+      if (AN.spoke || !AN.run) return;
+      AN.broken = true;
+      anKillWorker();
+      anSwitchMain();
+    }, AN_SILENT_MS);
+  }
+  function anUseMain() {
+    AN.main = true;
+    if (AN.data) AN.data.main = true;
+    AN.trapList = null;   // 詰み筋の調べの予算を、本体で読む分で決め直す
+  }
+  function anSwitchMain() {
+    anUseMain();
+    AN.job = null;
+    anNext();
+  }
+  // 本体で読むときの部品（詰み探索・評価の重み・学習した評価と、分析）を一度だけ読む
+  function anMainApi() {
+    const ok = () => window.ShogiAnalyze && typeof window.ShogiAnalyze.handle === 'function';
+    if (ok()) return window.ShogiAnalyze;
+    if (!AN.mainLoaded) {
+      AN.mainLoaded = true;
+      loadExtrasOnMain();
+      const src = $('src-analyze-worker');
+      if (src && src.textContent.trim()) {
+        try {
+          const s = doc.createElement('script');
+          s.textContent = src.textContent;
+          (doc.head || doc.body).appendChild(s);
+        } catch (e) { /* 読めなければ分析できない */ }
+      }
+    }
+    return ok() ? window.ShogiAnalyze : null;
+  }
+  function anRunMain(job) {
+    clearTimeout(AN.timer);
+    AN.timer = setTimeout(() => {
+      if (!AN.run || AN.job !== job) return;
+      const api = anMainApi();
+      if (!api) { anFail('この環境では分析の部品を読めませんでした'); return; }
+      let r;
+      try { r = api.handle(job); } catch (e) { r = { type: 'error', id: job.id, message: (e && e.message) || String(e) }; }
+      if (!AN.run || AN.job !== job) return;
+      if (!r || r.type === 'error') { anFail((r && r.message) || '原因不明'); return; }
+      anResult(job, r);
+    }, L.ANALYSIS_MAIN.gapMs);
+  }
+
+  /* -- 段取り -- */
+
+  // 次の仕事：まだ読んでいない局面を前から → 全部読んだら、詰み筋の調べを予算（局面数）の範囲で（重要な手から）。
+  // 調べる順は負けた側の手から（L.trapCandidates）。ある側に詰み筋の手が見つかったら、その側の後ろの手は後回し（L.trapNext）。
+  // 1回分の最低限の予算（L.trapCallMin）が残っていなければ始めない（残った候補の数は画面に出す：L.trapRest）
+  function anPickJob() {
+    const d = AN.data, rec = AN.rec;
+    const i = d.pos.indexOf(null);
+    if (i >= 0) {
+      AN.phase = 'eval';
+      return { type: 'eval', n: i, startSfen: rec.startSfen, moves: rec.moves.slice(0, i), timeMs: L.analysisMs(AN.speed, AN.main) };
+    }
+    AN.phase = 'trap';
+    if (!AN.trapList) {
+      AN.trapList = L.trapCandidates(d, rec, AN.judg);
+      AN.trapLeft = L.trapBudgetNodes(AN.speed, rec.moves.length, AN.main);
+    }
+    const b = L.trapBudget(AN.speed, AN.main);
+    if (AN.trapLeft < L.trapCallMin(b)) return null;
+    while (AN.trapList.length) {
+      const k = L.trapNext(AN.trapList, d, rec);
+      const n = AN.trapList.splice(k < 0 ? 0 : k, 1)[0];
+      const t = d.trap[n];
+      if (t && t[0] !== 3) continue;
+      const prev = d.pos[n - 1];
+      return {
+        type: 'trap', n, startSfen: rec.startSfen, moves: rec.moves.slice(0, n),
+        maxNodes: b.nodes, altNodes: b.altNodes,
+        altTotal: Math.max(0, Math.min(b.altTotal, AN.trapLeft - 2 * b.nodes)),
+        prefer: prev && prev[3] ? [prev[3]] : [],
+      };
+    }
+    return null;
+  }
+
+  function anNext() {
+    if (!AN.run) return;
+    if (!AN.main && !anWorker()) anUseMain();
+    const job = anPickJob();
+    if (!job) { anFinish(); return; }
+    job.id = ++AN.id;
+    AN.job = job;
+    if (AN.main) { anRunMain(job); return; }
+    try {
+      AN.w.postMessage(job);
+      anArmDog();
+    } catch (e) {
+      anKillWorker();
+      AN.broken = true;
+      anSwitchMain();
+    }
+  }
+
+  function anResult(job, r) {
+    AN.job = null;
+    const d = AN.data;
+    if (job.type === 'eval') {
+      const e = L.analysisEntry(r);
+      if (!e) { anFail('読みの結果の形が違います'); return; }
+      d.pos[job.n] = e;
+    } else {
+      d.trap[job.n] = L.trapEntry(r);
+      AN.trapLeft -= Math.max(0, Number(r.nodes) || 0);   // 予算は局面数（端末の速さに左右されない）
+    }
+    AN.unsaved++;
+    anDerive();
+    renderAnalysis();
+    if (AN.unsaved >= AN_SAVE_EVERY) anSave(false);
+    anNext();
+  }
+
+  function anStart(key) {
+    if (!HAS_ANALYSIS_UI || AN.run || !RV.rec || !RV.rv) return;
+    const rec = RV.rec;
+    AN.speed = L.analysisSpeed(key).key;
+    AN.main = !anWorkerPossible();
+    AN.rec = rec;
+    AN.data = L.startAnalysis(rec.analysis || null, rec, AN.speed, { now: Date.now(), main: AN.main, status: RV.rv.status });
+    AN.trapList = null;
+    AN.trapLeft = 0;
+    AN.unsaved = 0;
+    AN.msg = '';
+    AN.saveNote = '';
+    AN.bucket = '';
+    AN.job = null;
+    AN.phase = 'eval';
+    AN.run = true;
+    anDerive();
+    renderAnalysis();
+    anNext();
+  }
+
+  function anFinish() {
+    AN.data.done = AN.data.pos.every((x) => x !== null);
+    anEnd('分析が終わりました。');
+  }
+  // 「止める」・見返しを閉じた
+  function anStop() {
+    if (!AN.run) return;
+    anEnd('分析を止めました（そこまでの結果は残します）。');
+  }
+  function anFail(msg) {
+    if (!AN.run) return;
+    anEnd('分析を続けられませんでした（' + msg + '）。');
+  }
+  function anEnd(msg) {
+    AN.run = false;
+    AN.job = null;
+    clearTimeout(AN.timer);
+    anKillWorker();
+    AN.msg = msg;
+    const rec = AN.rec, data = AN.data;
+    if (rec && data && L.analysisProgress(data, rec).done > 0) anSave(true);
+    AN.rec = null;
+    AN.data = null;
+    AN.bucket = '';
+    if (rec && RV.rec === rec) { anDerive(); renderAnalysis(); }
+  }
+
+  // 記録に入れる（記録の写しにも入れるので、閉じて開き直してもすぐ出る）。final：終わり・止めたとき（結果を知らせる）
+  function anSave(final) {
+    const rec = AN.rec, data = AN.data;
+    if (!rec || !data) return;
+    AN.unsaved = 0;
+    const copy = L.cloneAnalysis(data);
+    rec.analysis = copy;
+    let p;
+    try { p = archiveSaveAnalysis(rec.id, copy); } catch (e) { p = Promise.reject(e); }
+    const show = () => { if (RV.rec === rec && el.dlgReview.open) renderAnStatus(anView()); };
+    p.then((ok) => {
+      if (!final) return;
+      AN.saveNote = ok ? '結果はこの棋譜の記録に入れました（もう一度開いても出ます）。' : '';
+      show();
+    }, () => {
+      // 分析の保存では対局の記録を消さない（lsSetAnalysis）。入りきらない・書けないときは、この分析だけを保存しない
+      AN.saveNote = '分析の結果を保存できませんでした（棋譜は消していません）。この見返しを閉じるまでは結果を見られます。';
+      show();
+    });
+  }
+
+  /* -- 読む時間を選ぶ（ページ内のダイアログ #dlg-an） -- */
+
+  function anBuildSpeeds() {
+    if (AN.speedInputs.length) return;
+    el.anSpeeds.textContent = '';
+    for (const sp of L.ANALYSIS_SPEEDS) {
+      const label = doc.createElement('label');
+      label.className = 'lv';
+      label.setAttribute('for', 'opt-an-' + sp.key);
+      const input = doc.createElement('input');
+      input.type = 'radio';
+      input.name = 'an-speed';
+      input.id = 'opt-an-' + sp.key;
+      input.value = sp.key;
+      const text = doc.createElement('span');
+      text.className = 'lv-text';
+      const name = doc.createElement('span');
+      name.className = 'lv-name';
+      name.textContent = sp.name;
+      const small = doc.createElement('small');
+      small.textContent = '1局面 ' + (sp.ms / 1000) + '秒';
+      name.appendChild(small);
+      const desc = doc.createElement('span');
+      desc.className = 'lv-desc';
+      desc.id = 'an-est-' + sp.key;
+      text.appendChild(name);
+      text.appendChild(desc);
+      label.appendChild(input);
+      label.appendChild(text);
+      el.anSpeeds.appendChild(label);
+      AN.speedInputs.push(input);
+    }
+  }
+
+  function anOpenChooser() {
+    const rec = RV.rec;
+    if (!rec || AN.run) return;
+    anBuildSpeeds();
+    const prev = rec.analysis || null;
+    const main = !anWorkerPossible();
+    const pick = prev ? L.analysisSpeed(prev.ms).key : 'normal';
+    const pr = prev ? L.analysisProgress(prev, rec) : null;
+    for (const inp of AN.speedInputs) {
+      const resume = L.canResume(prev, inp.value, main);
+      inp.checked = inp.value === pick;
+      const sec = L.analysisEstimateSec(rec.moves.length, inp.value, { main, done: resume ? pr.done : 0 });
+      const d = $('an-est-' + inp.value);
+      if (d) d.textContent = '目安 ' + L.formatDuration(sec) + (resume ? '（続きから）' : '');
+    }
+    const notes = [];
+    if (prev && L.canResume(prev, pick, main)) {
+      notes.push('途中まで（' + pr.done + '／' + pr.total + '局面）読んであります。同じ時間（' + L.analysisSpeed(prev.ms).name +
+        '）なら続きから、ほかの時間なら最初から読みます。');
+    } else if (prev && prev.done) {
+      notes.push('前の分析（' + L.analysisSpeed(prev.ms).name + '・' + L.formatDateTime(prev.at) + '）は、読み直した結果に替わります。');
+    }
+    if (main) notes.push('この環境では画面の裏で読めないので、1局面 ' + (L.ANALYSIS_MAIN.ms / 1000) + '秒までにして少しずつ読みます（詰み筋はほとんど調べられません）。');
+    notes.push('目安は長めです（読みが落ち着けば早く終わります）。');
+    el.anNote.textContent = notes.join('');
+    openDialog(el.dlgAn, el.btnRvAn);
+    const sel = AN.speedInputs.find((x) => x.checked) || AN.speedInputs[0];
+    try { sel.focus(); } catch (e) { /* 何もしない */ }
+  }
+
+  function anSubmit(e) {
+    if (e && e.preventDefault) e.preventDefault();
+    const chosen = AN.speedInputs.find((x) => x.checked);
+    closeDialog(el.dlgAn);   // 焦点は「分析」のボタン（これから「止める」になる）へ戻る
+    anStart(chosen ? chosen.value : 'normal');
+  }
+
+  /* -- 描く -- */
+
+  function renderAnalysis() {
+    if (!HAS_ANALYSIS_UI || !RV.rec || !RV.rv) return;
+    const a = anView();
+    renderAnButton(a);
+    renderGraph(a);
+    renderAnPos(a);
+    renderAnStatus(a);
+    renderAnHere(a);
+    renderAnSum(a);
+    renderMoveMarks(a);
+  }
+
+  function anRunningHere() {
+    return AN.run && AN.rec === RV.rec;
+  }
+
+  function renderAnButton(a) {
+    const b = el.btnRvAn;
+    let t, label;
+    if (anRunningHere()) { t = '止める'; label = '分析を止める'; }
+    else if (a && a.done) { t = '分析し直す'; label = '分析し直す（読む時間を選びます）'; }
+    else { t = '分析'; label = a ? '分析の続き（読む時間を選びます）' : '分析する（読む時間を選びます）'; }
+    if (b.textContent !== t) b.textContent = t;
+    if (b.getAttribute('aria-label') !== label) b.setAttribute('aria-label', label);
+    b.classList.toggle('is-run', anRunningHere());
+  }
+
+  // 見返している局面の文（グラフの読み上げ用）
+  function anPlaceText(a) {
+    const pt = L.reviewPositionText(RV.rv, RV.index);
+    const e = a && a.pos[RV.index];
+    if (!e) return pt.text;
+    const tx = L.analysisEvalText(e, RV.rec.humanSide, RV.index === RV.rv.positions.length - 1 ? RV.rv.status : null);
+    return pt.text + '　' + tx.text + '（' + tx.label + '）';
+  }
+
+  function graphX(i, n, w) { return n > 0 ? 4 + (w - 8) * i / n : w / 2; }
+  function graphY(v, h) { return h / 2 - v * (h / 2 - 3); }
+
+  function graphBuild() {
+    const s = doc.createElementNS(SVG_NS, 'svg');
+    s.setAttribute('class', 'rv-svg');
+    s.setAttribute('aria-hidden', 'true');
+    s.setAttribute('focusable', 'false');
+    s.setAttribute('preserveAspectRatio', 'none');
+    const mk = (tag, cls) => {
+      const e = doc.createElementNS(SVG_NS, tag);
+      e.setAttribute('class', cls);
+      s.appendChild(e);
+      return e;
+    };
+    G.mid = mk('line', 'g-mid');
+    G.area = mk('path', 'g-area');
+    G.line = mk('path', 'g-line');
+    G.marks = mk('g', 'g-marks');
+    G.cur = mk('line', 'g-cur');
+    G.top = mk('text', 'g-lab');
+    G.top.textContent = 'あなた';
+    G.bot = mk('text', 'g-lab');
+    G.bot.textContent = 'AI';
+    G.svg = s;
+    el.rvGraph.appendChild(s);
+  }
+
+  // 線・面・印を描き直す（分析の結果か大きさが変わったときだけ）
+  function graphDraw(a, w, h) {
+    const rec = RV.rec, n = rec.moves.length, side = rec.humanSide, mid = h / 2;
+    const f = (v) => (Math.round(v * 10) / 10).toString();
+    G.svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+    for (const [k, v] of [['x1', 0], ['y1', mid], ['x2', w], ['y2', mid]]) G.mid.setAttribute(k, f(v));
+    G.top.setAttribute('x', f(w - 4)); G.top.setAttribute('y', '10'); G.top.setAttribute('text-anchor', 'end');
+    G.bot.setAttribute('x', f(w - 4)); G.bot.setAttribute('y', f(h - 3)); G.bot.setAttribute('text-anchor', 'end');
+    let line = '', area = '';
+    let seg = [];
+    const flush = () => {
+      if (!seg.length) return;
+      const pts = seg.map((p) => p[0] + ' ' + p[1]).join('L');
+      line += 'M' + pts;
+      area += 'M' + seg[0][0] + ' ' + f(mid) + 'L' + pts + 'L' + seg[seg.length - 1][0] + ' ' + f(mid) + 'Z';
+      seg = [];
+    };
+    if (a) {
+      for (let i = 0; i <= n; i++) {
+        const v = L.graphValue(a.pos[i], side);
+        if (v === null) { flush(); continue; }
+        seg.push([f(graphX(i, n, w)), f(graphY(v, h))]);
+      }
+      flush();
+    }
+    G.line.setAttribute('d', line);
+    G.area.setAttribute('d', area);
+    G.marks.textContent = '';
+    if (!a || !AN.sum) return;
+    for (const m of AN.sum.marks) {
+      const v = L.graphValue(a.pos[m.n], side);
+      const x = graphX(m.n, n, w), y = graphY(v === null ? 0 : v, h);
+      let e;
+      if (m.trap) {
+        e = doc.createElementNS(SVG_NS, 'path');
+        e.setAttribute('d', 'M' + f(x) + ' ' + f(y - 5) + 'L' + f(x + 5) + ' ' + f(y) + 'L' + f(x) + ' ' + f(y + 5) + 'L' + f(x - 5) + ' ' + f(y) + 'Z');
+        e.setAttribute('class', 'g-trap');
+      } else {
+        e = doc.createElementNS(SVG_NS, 'circle');
+        e.setAttribute('cx', f(x));
+        e.setAttribute('cy', f(y));
+        e.setAttribute('r', m.grade === 'blunder' ? '3.4' : '3');
+        e.setAttribute('class', m.grade === 'blunder' ? 'g-blunder' : 'g-bad');
+      }
+      e.setAttribute('data-n', String(m.n));
+      G.marks.appendChild(e);
+      if (m.n === AN.sum.decisive) {
+        const ring = doc.createElementNS(SVG_NS, 'circle');
+        ring.setAttribute('cx', f(x));
+        ring.setAttribute('cy', f(y));
+        ring.setAttribute('r', '7');
+        ring.setAttribute('class', 'g-key');
+        G.marks.appendChild(ring);
+      }
+    }
+  }
+
+  function renderGraph(a) {
+    const rec = RV.rec, n = rec.moves.length, g = el.rvGraph;
+    g.setAttribute('aria-valuemax', String(n));
+    g.setAttribute('aria-valuenow', String(RV.index));
+    g.setAttribute('aria-valuetext', anPlaceText(a));
+    let msg = '';
+    if (anRunningHere()) {
+      const pr = L.analysisProgress(AN.data, rec);
+      msg = AN.phase === 'trap' ? '詰み筋を調べています' : '分析中 ' + pr.done + '／' + pr.total;
+    } else if (!a) {
+      msg = 'まだ分析していません';
+    }
+    if (el.rvGraphMsg) {
+      if (el.rvGraphMsg.textContent !== msg) el.rvGraphMsg.textContent = msg;
+      el.rvGraphMsg.classList.toggle('is-corner', !!a);
+    }
+    if (typeof doc.createElementNS !== 'function') return;   // 絵が描けない環境では一言だけ
+    if (!G.svg) graphBuild();
+    const w = Math.round(g.clientWidth || 0) || 320, h = Math.round(g.clientHeight || 0) || 48;
+    const key = AN.ver + ':' + w + 'x' + h + ':' + rec.id;
+    if (G.key !== key) {
+      G.key = key;
+      graphDraw(a, w, h);
+    }
+    const x = (Math.round(graphX(RV.index, n, w) * 10) / 10).toString();
+    G.cur.setAttribute('x1', x);
+    G.cur.setAttribute('x2', x);
+    G.cur.setAttribute('y1', '0');
+    G.cur.setAttribute('y2', String(h));
+  }
+
+  // グラフを押した・なぞった所の局面へ
+  function graphPick(e) {
+    if (!RV.rec || !e || typeof e.clientX !== 'number') return;
+    let r = null;
+    try { r = el.rvGraph.getBoundingClientRect(); } catch (x) { r = null; }
+    if (!r || !(r.width > 8)) return;
+    const n = RV.rec.moves.length;
+    const t = Math.max(0, Math.min(1, (e.clientX - r.left - 4) / (r.width - 8)));
+    reviewGo(Math.round(t * n));
+  }
+
+  // 手の位置の行に、その局面の点数（あなたから見た値）と、その手の印
+  function renderAnPos(a) {
+    if (!el.rvPosAn) return;
+    const i = RV.index;
+    let t = '', cls = 'rv-pos-an';
+    const e = a && a.pos[i];
+    if (e) {
+      const j = i > 0 ? AN.judg[i] : null;
+      const tx = L.analysisShortText(e, RV.rec.humanSide);
+      let mark = '';
+      if (j && j.trap && j.trap.st === 1) { mark = '詰み筋'; cls += ' is-trap'; }
+      else if (j && j.grade) { mark = L.GRADE_NAMES[j.grade]; cls += ' is-' + j.grade; }
+      t = (mark ? mark + ' ' : '') + tx;
+    }
+    if (el.rvPosAn.textContent !== t) el.rvPosAn.textContent = t;
+    if (el.rvPosAn.className !== cls) el.rvPosAn.className = cls;
+  }
+
+  // 状況の一行（見える行は毎回。読み上げ〔#rv-an-live〕は多くなりすぎないよう、分析中は4分の1ごとと、詰み筋の調べに移ったときだけ）
+  function renderAnStatus(a) {
+    const rec = RV.rec;
+    let t, bucket;
+    if (anRunningHere()) {
+      const pr = L.analysisProgress(AN.data, rec);
+      const sp = L.analysisSpeed(AN.speed);
+      if (AN.phase === 'trap') {
+        bucket = 'trap';
+        t = '全部の局面を読みました（' + sp.name + '）。いまは、自分の玉が詰む筋に入った手がないかを調べています。分析の間も進め戻しができます。';
+      } else {
+        bucket = 'eval:' + Math.floor(pr.done * 4 / Math.max(1, pr.total));
+        const left = L.analysisEstimateSec(rec.moves.length, AN.speed, { main: AN.main, done: pr.done });
+        t = '分析しています（' + sp.name + '・1局面 ' + (L.analysisMs(AN.speed, AN.main) / 1000) + '秒）：' + pr.done + '／' + pr.total +
+          '局面まで読みました（残り' + L.formatDuration(left) + '）。分析の間も進め戻しができます。';
+      }
+    } else {
+      const pr = a ? L.analysisProgress(a, rec) : null;
+      let s;
+      if (a && a.done) {
+        s = '分析済み：' + L.analysisSpeed(a.ms).name + '（1局面 ' + (a.ms / 1000) + '秒' + (a.main ? '。本体で読んだので 0.5 秒までに縮めました' : '') +
+          '）・' + L.formatDateTime(a.at) + '。';
+        if (a.main) s += '本体で読んだので、詰み筋はほとんど調べられません。';
+        const rest = L.trapRest(a, rec, AN.judg);
+        if (rest) {
+          s += '詰み筋の候補のうち ' + rest + '手は、予算の中で調べきれませんでした' +
+            (!a.main && L.analysisSpeed(a.ms).key !== 'deep' ? '（時間を長くして分析し直すと、多く調べます）' : '') + '。';
+        }
+      } else if (a) {
+        s = '途中まで分析してあります（' + pr.done + '／' + pr.total + '局面・' + L.analysisSpeed(a.ms).name + '）。「分析」で同じ時間を選ぶと続きから読みます。';
+      } else {
+        s = '「分析」を押すと、AI が局面を1つずつ読み直して、形勢のグラフ・点数が大きく落ちた手（悪手）・自分の玉が詰む筋に入った手を調べます。';
+      }
+      t = (AN.msg ? AN.msg : '') + s + (AN.saveNote ? AN.saveNote : '');
+      bucket = 'idle:' + t;
+    }
+    if (el.rvAnStatus.textContent !== t) el.rvAnStatus.textContent = t;
+    if (bucket === AN.bucket) return;
+    AN.bucket = bucket;
+    if (el.rvAnLive) el.rvAnLive.textContent = t;
+  }
+
+  // その局面の Game（読み筋の表記に使う）
+  function anGameAt(index) {
+    const rec = RV.rec;
+    const g = new Core.Game(rec.startSfen);
+    for (let k = 0; k < index && k < rec.moves.length; k++) g.play(rec.moves[k]);
+    return g;
+  }
+  function anPvText(index, pv, max) {
+    const list = String(pv || '').split(' ').filter(Boolean);
+    if (!list.length) return '';
+    try { return L.pvNotation(anGameAt(index), list, max || 8).join(' '); } catch (e) { return ''; }
+  }
+  function anLine(box, key, text, cls) {
+    const p = doc.createElement('p');
+    p.className = 'an-line' + (key ? '' : ' no-key') + (cls ? ' ' + cls : '');
+    if (key) p.appendChild(span('an-key', key));
+    p.appendChild(span('an-val', text));
+    box.appendChild(p);
+    return p;
+  }
+
+  // 「この局面」：この手の判定・その局面で AI ならどう指したか・詰み筋・この局面の形勢と次の候補
+  function renderAnHere(a) {
+    const key = AN.ver + ':' + RV.index + ':' + RV.rec.id;
+    if (AN.hereKey === key) return;
+    AN.hereKey = key;
+    const box = el.rvAnHere;
+    box.textContent = '';
+    if (!a) return;
+    const rec = RV.rec, i = RV.index, side = rec.humanSide;
+    if (i > 0) {
+      const j = AN.judg[i];
+      const r = RV.rv.records[i - 1];
+      const mv = i + '手目 ' + (r && r.jp ? r.jp : '');
+      const who = j && j.side === side ? 'あなた' : 'AI';
+      const trap = !!(j && j.trap && j.trap.st === 1);
+      let what = trap && j.grade ? L.GRADE_NAMES[j.grade] + '・詰み筋に入った手' : trap ? '詰み筋に入った手' : j && j.grade ? L.GRADE_NAMES[j.grade] : '';
+      let val = mv + (what ? '：' + what : '');
+      if (j && j.drop !== null) val += '（' + who + 'から見て ' + L.dropText(j.drop) + '点）';
+      anLine(box, 'この手', val, trap ? 'is-trap' : j && j.grade ? 'is-' + j.grade : '');
+      const t = j && j.trap;
+      const ex = t ? t.ex.map((u) => anPvText(i - 1, u, 1)).filter(Boolean).join('、') : '';
+      if (j && j.best) {
+        if (j.best !== rec.moves[i - 1]) anLine(box, 'AI なら', anPvText(i - 1, j.pv || j.best) || j.best);
+        else if (t && (t.st === 1 || t.st === 2 || t.st === 3)) {
+          // 分析の読みは相手の詰みを見張らない（mateGuard なし）ので、詰み筋に入る手を選ぶことがある。矛盾して見えないよう書き分ける
+          anLine(box, 'AI なら', 'AI の読み（相手の詰みの見張りなし）でも同じ手を選びます。' + (ex ? '詰まされない手の例：' + ex : ''));
+        } else anLine(box, 'AI なら', '同じ手を指します');
+      }
+      if (t) {
+        if (t.st === 1) {
+          anLine(box, '', 'この手で詰み筋に入りました：' + L.mateLenText(t.len) + '。その局面で詰まされない手は ' + t.safe + '個ありました' +
+            (ex ? '（例：' + ex + '）' : '') + '。' + (t.unknown ? 'ほかに、予算の中で調べきれなかった手が ' + t.unknown + '個あります。' : ''), 'an-trap');
+        } else if (t.st === 2) {
+          anLine(box, '', 'この手のあと、相手に詰みがあります：' + L.mateLenText(t.len) + '。' +
+            (t.total > 1 ? 'その局面のほかの手も全部調べて、どれも詰まされました。' : 'その局面には、ほかに指せる手がありませんでした。'), 'an-sub');
+        } else if (t.st === 3) {
+          anLine(box, '', 'この手のあと、相手に詰みがあります：' + L.mateLenText(t.len) + '。その局面のほかの手で詰まされないかは、予算の中では分かりませんでした' +
+            (t.unknown ? '（調べきれなかった手が ' + t.unknown + '個）' : '') + '。' + (a.done ? '' : '分析の続きで調べ直します。'), 'an-sub');
+        } else if (t.st === 0) {
+          anLine(box, '', 'この手のあと、王手の連続の詰みはありません（調べた範囲）。', 'an-sub');
+        } else {
+          anLine(box, '', 'この手のあとに詰みがあるかは、予算の中では分かりませんでした。', 'an-sub');
+        }
+      }
+    }
+    const e = a.pos[i];
+    if (e) {
+      const tx = L.analysisEvalText(e, side, i === RV.rv.positions.length - 1 ? RV.rv.status : null);
+      anLine(box, '形勢', tx.text + '（' + tx.label + '）' + (e[2] > 0 ? '・深さ ' + e[2] : ''));
+      if (e[3]) anLine(box, '次の候補', anPvText(i, e[4] || e[3]) || e[3]);
+    } else {
+      anLine(box, '形勢', 'この局面はまだ読んでいません');
+    }
+  }
+
+  function anJumpButton(n, extra) {
+    const b = doc.createElement('button');
+    b.type = 'button';
+    b.className = 'an-jump';
+    b.setAttribute('data-n', String(n));
+    const r = RV.rv.records[n - 1];
+    const mv = n + '手目 ' + (r && r.jp ? r.jp : '');
+    b.appendChild(span('an-jump-mv', mv));
+    if (extra) b.appendChild(span('an-jump-tag', extra));
+    b.setAttribute('aria-label', mv + (extra ? '（' + extra + '）' : '') + 'の局面へ');
+    return b;
+  }
+
+  // まとめ：あなたの悪手・AI の悪手・詰み筋に入った手・勝負を分けた手・印の付いた手の一覧（押すとその局面へ）
+  function renderAnSum(a) {
+    const key = AN.ver + ':' + RV.rec.id;
+    if (AN.sumKey === key) return;
+    AN.sumKey = key;
+    const box = el.rvAnSum;
+    box.textContent = '';
+    const s = AN.sum;
+    if (!a || !s) return;
+    const head = doc.createElement('p');
+    head.className = 'an-sum-head';
+    head.textContent = 'まとめ' + (s.done < s.total ? '（' + s.done + '／' + s.total + '局面まで）' : '');
+    box.appendChild(head);
+    const cnt = (o) => (o.bad + o.blunder) + '（うち大悪手 ' + o.blunder + '）';
+    anLine(box, '悪手', 'あなた ' + cnt(s.you) + '・AI ' + cnt(s.ai));
+    const rest = anRunningHere() ? null : L.trapRest(a, RV.rec, AN.judg);
+    anLine(box, '詰み筋', (s.traps
+      ? 'その手で詰み筋に入った手：あなた ' + s.you.trap + '・AI ' + s.ai.trap + '（調べた手 ' + s.traps + '）' +
+        (rest ? (a.done ? '。予算の中で調べきれなかった候補 ' + rest + '手' : '。まだ調べていない候補 ' + rest + '手（分析の続きで調べます）') : '')
+      : '全部の局面を読んだあとに調べます') + (a.main ? '。本体で読んだので、詰み筋はほとんど調べられません' : ''));
+    const kp = doc.createElement('p');
+    kp.className = 'an-line';
+    kp.appendChild(span('an-key', '勝負を分けた手'));
+    if (s.decisive) {
+      const j = AN.judg[s.decisive];
+      const tag = [j && j.grade ? L.GRADE_NAMES[j.grade] : '', j && j.trap && j.trap.st === 1 ? '詰み筋' : ''].filter(Boolean).join('・');
+      kp.appendChild(anJumpButton(s.decisive, tag));
+    } else {
+      kp.appendChild(span('an-val', rec2text()));
+    }
+    box.appendChild(kp);
+    if (s.marks.length) {
+      const ul = doc.createElement('ul');
+      ul.className = 'an-marks';
+      ul.setAttribute('aria-label', '印の付いた手（押すとその局面へ）');
+      for (const m of s.marks) {
+        const j = AN.judg[m.n];
+        const tag = [m.grade ? L.GRADE_NAMES[m.grade] : '', m.trap ? '詰み筋' : ''].filter(Boolean).join('・') +
+          (j && j.drop !== null ? ' ' + L.dropText(j.drop) : '') + '・' + (m.side === RV.rec.humanSide ? 'あなた' : 'AI');
+        const li = doc.createElement('li');
+        li.appendChild(anJumpButton(m.n, tag));
+        ul.appendChild(li);
+      }
+      box.appendChild(ul);
+    }
+    const foot = doc.createElement('p');
+    foot.className = 'an-foot';
+    foot.textContent = '点数は、このページの AI が1局面 ' + (a.ms / 1000) + '秒' + (a.main ? '（本体で読んだので 0.5 秒まで）' : '') +
+      'ずつ読み直した値です（歩1枚≒100点）。グラフの上があなた有利、詰みは上下の端です。悪手は指した側から見て ' + L.BAD_DROP +
+      '点以上、大悪手は ' + L.BLUNDER_DROP + '点以上落ちた手（AI の読みと同じ手は除く）。詰み筋は、その手のあとに王手の連続の詰みがあるかだけを、' +
+      '負けた側の手から、点数が大きく動いた手と終盤の手の順に、予算（読む局面の数）の範囲で調べています（見落としもあります）。' +
+      '詰みの手数は見つけた手順の手数で、最短とは限りません。' +
+      (a.main ? '本体で読んだので、詰み筋の予算はとても小さく、ほとんど調べられません。' : '');
+    box.appendChild(foot);
+
+    function rec2text() {
+      if (!RV.rec.winner) return '引き分けなので、ありません';
+      return s.done < s.total ? '全部の局面を読むと出ます' : '大きな悪手は見つかりませんでした';
+    }
+  }
+
+  // 指し手の一覧に印（悪手・大悪手・詰み筋）
+  function renderMoveMarks(a) {
+    const key = AN.ver + ':' + RV.rec.id;
+    if (AN.marksKey === key) return;
+    AN.marksKey = key;
+    for (let i = 1; i < RV.moveBtns.length; i++) {
+      const b = RV.moveBtns[i];
+      const j = a ? AN.judg[i] : null;
+      const trap = !!(j && j.trap && j.trap.st === 1);
+      const grade = j ? j.grade : '';
+      const t = trap ? '詰み筋' : grade ? L.GRADE_NAMES[grade] : '';
+      const m = b.children[3];
+      if (m && m.textContent !== t) m.textContent = t;
+      b.classList.toggle('is-bad', grade === 'bad');
+      b.classList.toggle('is-blunder', grade === 'blunder');
+      b.classList.toggle('is-trap', trap);
+      const base = b.getAttribute('data-label') || '';
+      const tag = [grade ? L.GRADE_NAMES[grade] : '', trap ? '詰み筋' : ''].filter(Boolean).join('・');
+      const lab = tag ? base + '（' + tag + '）' : base;
+      if (b.getAttribute('aria-label') !== lab) b.setAttribute('aria-label', lab);
+    }
+  }
+
+  function bindAnalysis() {
+    el.btnRvAn.addEventListener('click', () => { if (anRunningHere()) anStop(); else anOpenChooser(); });
+    el.formAn.addEventListener('submit', anSubmit);
+    el.btnAnCancel.addEventListener('click', () => closeDialog(el.dlgAn));
+    const g = el.rvGraph;
+    let drag = false;
+    g.addEventListener('click', graphPick);
+    g.addEventListener('pointerdown', (e) => {
+      drag = true;
+      try { if (e && e.pointerId != null && g.setPointerCapture) g.setPointerCapture(e.pointerId); } catch (x) { /* 何もしない */ }
+      graphPick(e);
+    });
+    g.addEventListener('pointermove', (e) => { if (drag) graphPick(e); });
+    g.addEventListener('pointerup', () => { drag = false; });
+    g.addEventListener('pointercancel', () => { drag = false; });
+    el.rvAnSum.addEventListener('click', (e) => {
+      const b = e.target && e.target.closest ? e.target.closest('.an-jump') : null;
+      if (!b) return;
+      const n = Number(b.getAttribute('data-n'));
+      if (Number.isInteger(n)) reviewGo(n);
+    });
+    window.addEventListener('resize', () => {
+      if (!el.dlgReview.open) return;
+      G.key = '';
+      renderAnalysis();
+    });
+  }
+
+  function bindArchive() {
+    el.btnSaved.addEventListener('click', () => openSaved(el.btnSaved, ''));
+    el.btnSavedClose.addEventListener('click', () => closeDialog(el.dlgSaved));
+    el.savedList.addEventListener('click', (e) => {
+      const b = e.target && e.target.closest ? e.target.closest('button') : null;
+      if (!b) return;
+      const id = b.getAttribute('data-id'), act = b.getAttribute('data-act');
+      if (!id) return;
+      if (act === 'open') openReview(id);
+      else if (act === 'copy') copyRecord(findRecord(id), b);
+      else if (act === 'delete') askDelete(id, 'list', b);
+    });
+
+    const step = (btn, action) => btn.addEventListener('click', () => {
+      if (btn.getAttribute('aria-disabled') === 'true') return;
+      reviewGo(action);
+    });
+    step(el.btnRvFirst, 'first');
+    step(el.btnRvPrev, 'prev');
+    step(el.btnRvNext, 'next');
+    step(el.btnRvLast, 'last');
+    el.rvMoves.addEventListener('click', (e) => {
+      const b = e.target && e.target.closest ? e.target.closest('.rv-mv') : null;
+      if (!b) return;
+      const i = Number(b.getAttribute('data-i'));
+      if (Number.isInteger(i)) reviewGo(i);
+    });
+    // キーボード：左右で1手ずつ、Home・End で最初・最後（見返しの中のどこに焦点があっても）
+    el.dlgReview.addEventListener('keydown', (e) => {
+      if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      const act = L.reviewKeyAction(e.key);
+      if (!act || !RV.rv) return;
+      e.preventDefault();
+      reviewGo(act);
+    });
+    el.btnRvClose.addEventListener('click', () => closeDialog(el.dlgReview));
+    el.btnRvCopy.addEventListener('click', () => copyRecord(RV.rec, el.btnRvCopy));
+    el.btnRvFlip.addEventListener('click', () => { RV.flip = !RV.flip; renderReview(); });
+    el.btnRvList.addEventListener('click', () => {
+      el.dlgReview._opener = null;
+      closeDialog(el.dlgReview);
+      openSaved(el.btnSaved, '');
+    });
+    el.btnRvDelete.addEventListener('click', () => { if (RV.rec) askDelete(RV.rec.id, 'review', el.btnRvDelete); });
+
+    el.btnDelNo.addEventListener('click', () => { S.delTarget = null; closeDialog(el.dlgDel); });
+    el.btnDelYes.addEventListener('click', doDelete);
+    el.dlgDel.addEventListener('close', () => { S.delTarget = null; });
   }
 
   /* ---------- 音（WebAudio で合成した駒音） ---------- */
@@ -45928,7 +49309,7 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     doc.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
       if (S.promo) { e.preventDefault(); cancelPromo(); return; }
-      if (S.sel && !(el.dlgNew.open || el.dlgResign.open || el.dlgOver.open || el.dlgKif.open)) {
+      if (S.sel && !anyDialogOpen()) {
         S.sel = null;
         render();
       }
@@ -45983,9 +49364,21 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     el.btnKifSelect.addEventListener('click', selectKifText);
     el.btnKifClose.addEventListener('click', () => closeDialog(el.dlgKif));
 
-    for (const d of [el.dlgNew, el.dlgResign, el.dlgOver, el.dlgKif]) {
+    const dialogs = [el.dlgNew, el.dlgResign, el.dlgOver, el.dlgKif];
+    if (HAS_ARCHIVE_UI) {
+      dialogs.push(el.dlgSaved, el.dlgReview, el.dlgDel);
+      bindArchive();
+    }
+    if (HAS_ANALYSIS_UI) {
+      dialogs.push(el.dlgAn);
+      bindAnalysis();
+    }
+    for (const d of dialogs) {
       d.addEventListener('close', () => {
+        // 見返しを閉じたら、分析を止めて（そこまでの結果は記録に入れる）から、止めていた AI の読みを始め直す
+        if (d === el.dlgReview && HAS_ANALYSIS_UI) anStop();
         restoreFocus(d);
+        if (d === el.dlgReview) resumeAfterReview();
         // 後回しにしていた終局の札（同じ対局のまま、ほかのダイアログが閉じた）
         if (S.overPending && S.overPending === S.overShown && S.game.status().over && !anyDialogOpen()) showOver();
       });
@@ -46011,6 +49404,12 @@ ls1g2snl/4k1gb1/n1pppppp1/8p/p8/2r2P2P/3PP1P2/1BG3SR1/LNS1KG1NL b P4p	2h2e:12:10
     markStandalone();
     buildBoard();
     buildNewDialog();
+    if (HAS_ARCHIVE_UI) buildReviewBoard();
+    else if (el.btnSaved) el.btnSaved.hidden = true;
+    // 分析の部品がそろっていなければ、グラフと「分析」の段・説明の欄を出さない
+    if (HAS_ARCHIVE_UI && !HAS_ANALYSIS_UI) {
+      for (const id of ['rv-an', 'rv-an-detail']) { const x = $(id); if (x) x.hidden = true; }
+    }
     bind();
     if (restore()) {
       touch();
