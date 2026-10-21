@@ -3188,75 +3188,135 @@ select {
   // 時間切れで途中までになった深さでも、前の最善手より良いと読み切れた手（とその読み筋）
   let partialMove = 0, partialScore = 0, partialPv = [];
 
-  // ===== 相手の詰みの見張り（2026-10-21）=====
-  // 根で「この深さでいちばん良さそうな手」（先頭の手か、alpha を超えた手）を指したあとの局面で、相手が王手の連続で
-  // 詰ませられるかを詰み探索（つなぎ口 b。engine/mate.js の solvePosition）で調べる。詰まされるなら、その手の点を
-  // 「1＋詰みの手数で詰まされる」値に替える（反復深化がそのまま次に良い手を選ぶ。全部の手が詰まされるなら、見張りが無ければ指していた手）。
-  // 調べた結果は手ごとに覚え、同じ search の中では同じ手を2回調べない。予算は持ち時間（局面数で区切るときは局面数）の guardShare。
+  // ===== 相手の詰みの見張り（2026-10-21。同じ日の夜に予算の使い方を直した）=====
+  // 「指そうとしている手」を指したあとの局面（相手の番）で、相手が王手の連続で詰ませられるかを詰み探索（つなぎ口 b。
+  // engine/mate.js の solvePosition）で調べる。詰まされるなら、その手の点を「1＋詰みの手数で詰まされる」値に替え、
+  // 根の手を並べ替えて1つ浅い深さから読み直し、次に良い手を選ぶ（その手も同じように調べる。並列なら手伝いにもその手を外させる）。
   // 作者が v4 の最強に勝った棋譜（docs/棋譜/2026-10-21_分析.md）の 116手目のように、読みの深さでは届かない長い詰みを見落とすのを防ぐ。
+  // 「指そうとしている手」＝深さを1つ読み切ったときの最善手（並列なら、手伝いの結果も合わせて選ぶ手）。
+  // 予算は3つ（設計 §8 の (b')）：
+  //   (1) 深さを読み切るたび：見張りの予算（持ち時間〔局面数で区切るときは局面数〕の guardShare）から。初めての手は1回にその半分まで。
+  //       並列で読むときは、主が見張りをしている間も手伝いが読み続けるので、3本目からの手伝い1本ごとに持ち時間の gsmp（0.1）を足す（GUARD_SMP_MAX〔40%〕まで）。
+  //       「分からない」だった手は、危ない（guardRisky）ときだけ、前に使った分の半分以上を使えるなら調べ直す（詰み探索の置換表に続きが残るので、使う量を増やしていく）
+  //   (2) 時間の使い方で指すと決めたとき：読みで使わずに残った持ち時間の半分（tune.gleft）。(1) の残りの方が多ければそれ
+  //   (3) 読みのあと：持ち時間の上限から先の 5%（GUARD_EXTRA）まで。指す手が詰まないと分からないまま深さを読み終えたときは、
+  //       読みの上限を持ち時間の 20%（tune.gres）だけ前に倒し、その分も (3) に回す（時間切れで止まっても、指す手を調べる時間を残す）
+  // 最後まで「分からない」手は、危ない（guardRisky）ときだけ、詰まないと分かった手で点が近い（tune.gnear 点まで）手があればその手に替え（最後に読み切った深さの手が
+  // 詰まないと分かっていればその手）、無ければ詰まされないものとして指す（並列の主の手が詰まないと分かっていれば、いつでも主の手）。
+  // 読みの上限を前に倒すのも危ないときだけ。どの手も詰まされるときは、いちばん長く粘れる手（最短の詰みで比べる）。
   let gOn = false, gTimed = true, gMinDepth = 4;
-  let gLeftMs = 0, gPerMs = 0, gLeftNodes = 0, gPerNodes = 0, gExtraMs = 0;
-  // gMap：手 → 結果（>0 詰まされる手数・0 詰まされない・−1 分からない／調べなかった）
-  // gOver：見張りが外した手（点を詰まされる値に替えた手）→ 外したときの読みの点（どの手も詰まされるとき、見張りが無ければ指していた手を選ぶため）
-  let gMap = null, gOver = null;
-  const GUARD_LONG = 11;   // どの手も詰まされるとき、これ以上の手数の詰みは「相手が見つけにくい」とみなす（下の「どの手も詰まされる」）
-  let gChecks = 0, gMated = 0, gNodes = 0, gMs = 0;
+  let gLeftMs = 0, gPerMs = 0, gLeftNodes = 0, gPerNodes = 0;
+  // gT0・gTime：search の始めの時刻と持ち時間。gEnd：(3) の終わり（持ち時間の上限＋5%）。gNodeCap：局面数の上限。gExtraNodes：局面数で区切るときの (3) の残り
+  let gT0 = 0, gTime = 0, gEnd = 0, gNodeCap = Infinity, gExtraNodes = 0;
+  // gMap：手 → 結果（>0 詰まされる手数〔相手の番から〕・0 詰まされない・−1 分からない）。gSpent：「分からない」手に使った量（時間なら ms、局面数で区切るときは局面数）
+  // gScore：調べたときの読みの点。gShort：最短の手数を確かめた（確かめようとした）手。gOver：見張りが外した手 → 外したときの読みの点
+  let gMap = null, gSpent = null, gScore = null, gShort = null, gOver = null;
+  const GUARD_EXTRA = 0.05, GUARD_SMP_MAX = 0.4;
+  let gShare = 0.2;
+  // どの手も詰まされるとき、見張りが見つけた詰みでも、これ以下の手数（相手の番から）なら相手にも見える長さとして投了する
+  const GUARD_SEEN = 11;
+  // 「危ない」＝この search で、見張りが詰まされる手を1つでも見つけたとき（guardRisky）。危ないときだけ、深さごとの予算で「分からない」手を調べ直し、
+  // 読みの上限を前に倒し、分からない手を詰まないと分かった手に替える。ふだんの局面では「詰まない」の言い切りが重いだけの手も多く
+  // （3万局面以上ねばる手が 1 割ほど）、そこで読みの時間を削ったり手を替えたりすると弱くなるため（docs/読みの改良.md 10.8）
+  function guardRisky() { return gMated > 0; }
+  let gChecks = 0, gMated = 0, gNodes = 0, gMs = 0, gSwap = 0;
+  let gLastMs = 0, gLastNodes = 0;
   // 読みの途中の詰み探索（tune.dmate。既定はしない）に使う物と、その回数（確かめ用）
   let dmSolver = null, dmCalls = 0, dmHits = 0, dmNodes = 0;
-  // 手 m を指したあとの局面 p（相手の番）で、相手が王手の連続で詰ませられるか。返り値は gMap の値と同じ。
-  // over：根の読みが終わったあと（並列の手伝いの手を確かめるとき）。持ち時間の上限ではなく、持ち時間の 5% までなら超えてよい
-  function guardCheck(p, m, over) {
-    const c = gMap.get(m);
-    if (c !== undefined) return c;
+
+  // 手 m を時間 tb（ms。局面数で区切るときは使わない）・局面数 nb の予算で調べる。pool なら (1) の予算から引く。raw はそのときの読みの点。
+  // 返り値は gMap の値（予算が足りなければ調べずに今の値。調べたことのない手は −1）
+  function guardAt(p, m, tb, nb, pool, raw) {
+    gLastMs = 0; gLastNodes = 0;
     const ms = getMate();
-    let nb = Math.min(gPerNodes, gLeftNodes), tb = 0;
-    if (gTimed) {
-      tb = Math.min(gPerMs, gLeftMs, over ? gExtraMs : hardLimit - now());
-      if (tb < 5) nb = 0;
-    }
-    if (!(nb >= 200) || !ms) { gMap.set(m, -1); return -1; }
+    if (!ms || !(nb >= 200) || (gTimed && !(tb >= 5))) return gMap.has(m) ? gMap.get(m) : -1;
+    p.makeMove(m);
     const t0 = now();
     let r = null;
-    try { r = ms.solvePosition(p, { maxNodes: nb, timeMs: gTimed ? tb : undefined, pv: false }); } catch (e) { r = null; }
-    const el = now() - t0;
-    gLeftMs -= el; gMs += el; gChecks++;
-    if (over) gExtraMs -= el;
-    const used = r && r.nodes > 0 ? r.nodes : 0;
-    gLeftNodes -= used; gNodes += used;
+    try { r = ms.solvePosition(p, { maxNodes: Math.floor(nb), timeMs: gTimed ? tb : undefined, pv: false }); } catch (e) { r = null; }
+    const el = now() - t0, used = r && r.nodes > 0 ? r.nodes : 0;
+    p.unmakeMove(m);
+    gLastMs = el; gLastNodes = used;
+    gMs += el; gNodes += used; gChecks++;
+    if (pool) { gLeftMs -= el; gLeftNodes -= used; }
     const v = r && r.result === 'mate' ? Math.max(1, r.length | 0) : r && r.result === 'nomate' ? 0 : -1;
-    if (v > 0) gMated++;
     gMap.set(m, v);
+    gScore.set(m, raw);
+    if (v > 0) { gMated++; gOver.set(m, raw); }
+    if (v < 0) gSpent.set(m, (gSpent.get(m) || 0) + (gTimed ? el : used));
     return v;
   }
-  // 読みが終わったあと（指す手を決める直前）に、手 m がまだ調べられていないか「分からない」なら、残りの予算で調べる。
-  // 持ち時間の上限ではなく、持ち時間の 5% までなら超えてよい（over）。返り値は gMap の値と同じ
-  function guardFinal(p, m) {
+  // (1) 深さを読み切ったとき：手 m を見張りの予算から調べる
+  function guardIter(p, m, raw) {
     const st = gMap.get(m);
     if (st !== undefined && st !== -1) return st;
-    gMap.delete(m);
-    const sMs = gPerMs, sN = gPerNodes;
-    gPerMs = gLeftMs; gPerNodes = gTimed ? gPerNodes : gLeftNodes;
-    p.makeMove(m);
-    const len = guardCheck(p, m, true);
-    p.unmakeMove(m);
-    gPerMs = sMs; gPerNodes = sN;
-    return len;
+    const spent = gSpent.get(m) || 0;
+    const cap = gTimed ? Math.min(gLeftMs, hardLimit - now()) : gLeftNodes;
+    const per = gTimed ? gPerMs : gPerNodes;
+    const b = st === undefined ? Math.min(per, cap) : guardRisky() && cap >= spent * 0.5 ? Math.min(cap, Math.max(per, spent)) : 0;
+    return gTimed ? guardAt(p, m, b, 3000000, true, raw) : guardAt(p, m, 0, b, true, raw);
   }
-  // 読みを終える前に、指そうとしている手 m の見張りが「分からない」（1回の予算が尽きた）なら、残りの予算を全部使ってもう一度調べる
-  // （詰み探索の置換表に前の続きが残っているので、続きから読める）。詰まされると分かったら true（読みを続けて、次に良い手を選ぶ）。raw はその手の読みの点
-  function guardRecheck(p, m, raw) {
-    if (!gOn) return false;
+  // (2) 時間の使い方で指すと決めたとき：手 m を、残った持ち時間の半分（(1) の残りの方が多ければそれ）で調べる。used は読んだ局面数
+  function guardLeft(p, m, raw, used) {
     const st = gMap.get(m);
-    if ((st !== -1 && st !== undefined) || !(gLeftNodes >= 200) || (gTimed && !(gLeftMs >= 5))) return false;
-    gMap.delete(m);
-    const sMs = gPerMs, sN = gPerNodes;
-    gPerMs = gLeftMs; gPerNodes = gTimed ? gPerNodes : gLeftNodes;
+    if (st !== undefined && st !== -1) return st;
+    if (gTimed) {
+      const left = gT0 + gTime - now();
+      return guardAt(p, m, Math.min(left, Math.max(gLeftMs, left * T_gleft)), 50000000, false, raw);
+    }
+    return guardAt(p, m, 0, Math.max(gLeftNodes, (gNodeCap - used) * T_gleft), false, raw);
+  }
+  // (3) 読みのあと：手 m を、(3) の残りの 6 割で調べる。前に使った分の 4 分の 1 にも届かないなら調べない（増やしても見込みが薄い）
+  function guardLast(p, m, raw) {
+    const st = gMap.get(m);
+    if (st !== undefined && st !== -1) return st;
+    const spent = gSpent.get(m) || 0;
+    const b = gTimed ? (gEnd - now()) * 0.6 : gExtraNodes * 0.6;
+    if (b < spent * 0.25) return st === undefined ? -1 : st;
+    const v = gTimed ? guardAt(p, m, b, 50000000, false, raw) : guardAt(p, m, 0, b, false, raw);
+    if (!gTimed) gExtraNodes -= gLastNodes;
+    return v;
+  }
+  // どの手も詰まされるとき、見張りが見つけた詰みの最短の手数を (3) の残りで確かめる（相手の番から数えた手数。確かめられなければ −1）
+  function guardShortest(p, m) {
+    const ms = getMate();
+    const b = gTimed ? (gEnd - now()) * 0.6 : gExtraNodes * 0.6;
+    if (!ms || !(b >= (gTimed ? 20 : 1000))) return -1;
     p.makeMove(m);
-    const len = guardCheck(p, m, false);
+    const t0 = now();
+    let r = null;
+    try {
+      // 手順の取り出し（pvNodes）は時間で止まらないので小さくする（置換表に証明が残っていれば、ほとんど使わない）
+      r = ms.solvePosition(p, { maxNodes: gTimed ? 50000000 : Math.floor(b), timeMs: gTimed ? b : undefined, pv: true, pvNodes: 1000,
+        shortest: true, shortestNodes: gTimed ? 50000000 : Math.floor(b) });
+    } catch (e) { r = null; }
     p.unmakeMove(m);
-    gPerMs = sMs; gPerNodes = sN;
-    if (len > 0) { gOver.set(m, raw); return true; }
-    return false;
+    const used = r && r.nodes > 0 ? r.nodes : 0;
+    gMs += now() - t0; gNodes += used; gChecks++;
+    if (!gTimed) gExtraNodes -= used;
+    return r && r.result === 'mate' && r.shortest && r.length > 0 ? r.length : -1;
+  }
+  // どの手も詰まされるとき：いちばん長く粘れる手（最短の詰みがいちばん長い手。手数は根から数える）を返す { move, plies, guard }。
+  // 見張りの手数は詰み探索の手順の長さ（最短とは限らない。上限）なので、いちばん長そうな手が見張りの手なら、その最短の手数を確かめて比べ直す。
+  // 読みが読み切った詰みの手数はそのまま使う（王手でない手を挟む詰みもあり、詰み探索では確かめられないため）。
+  // 同じ手数なら読みが読み切った手（そのときは今までどおり投了する。相手にも見える長さのため）、その次は並びの前の手（直前の深さの最善手に近い）
+  function guardLongest(p) {
+    for (let tries = 0; tries <= rootN; tries++) {
+      let bm = 0, bl = -1, bg = false;
+      for (let i = 0; i < rootN; i++) {
+        const m = rootMoves[i], gl = gMap.get(m);
+        const g = gl > 0;
+        const pl = g ? 1 + gl : rootScores[i] <= -MATE_BOUND ? rootScores[i] + MATE : -1;
+        if (pl > bl || (pl === bl && bg && !g)) { bm = m; bl = pl; bg = g; }
+      }
+      if (bm === 0) return null;
+      if (!bg || gShort.has(bm)) return { move: bm, plies: bl, guard: bg };
+      gShort.add(bm);
+      const sh = guardShortest(p, bm);
+      if (sh > 0) gMap.set(bm, sh);
+      else return { move: bm, plies: bl, guard: bg };
+    }
+    return null;
   }
 
   // 置換表を用意する。メモリが足りない環境では小さくして続ける（2^16 欄まで。それより小さい指定はそのまま）
@@ -3522,9 +3582,12 @@ select {
   // smpskip：並列の読みで、手伝いが読む深さを手伝いごとにずらして間引く（false＝全員がすべての深さを読む）／
   // gdepth：相手の詰みの見張りを始める根の深さ／dmate：読みの途中で、手番側の王手の連続の詰みを詰み探索で調べる最小の残りの深さ（0＝調べない）・
   // dmn：その1回の予算（局面数）。dmate は 2026-10-21 に試した案（docs/読みの改良.md 第10節）
-  const TUNE_DEFAULT = { se: true, chk: 1, m1d: 3, ecache: true, lsort: true, cont: true, dropord: true, pc: true, tm: true, lmr: 2.2, ttbits: 21, smpskip: true, gdepth: 4, dmate: 0, dmn: 600 };
+  // gleft・gres・gnear・gsmp・gback：相手の詰みの見張りの予算（上の「相手の詰みの見張り」。(2) の残った持ち時間の割合・(3) の読みの上限を前に倒す割合・
+  // 詰まない手に替える点の幅・並列のとき手伝い1本ごとに (1) の予算に足す割合・(3) で分からない手を最後に読み切った深さの詰まない手に戻すか）
+  const TUNE_DEFAULT = { se: true, chk: 1, m1d: 3, ecache: true, lsort: true, cont: true, dropord: true, pc: true, tm: true, lmr: 2.2, ttbits: 21, smpskip: true, gdepth: 4, dmate: 0, dmn: 600,
+    gleft: 0.5, gres: 0.2, gnear: 150, gsmp: 0.1, gback: true };
   let T_se = true, T_chk = 1, T_m1d = 3, T_lsort = true, T_cont = true, T_dropord = true, T_pc = true, T_tm = true, T_ttbits = 21, T_smpskip = true;
-  let T_gdepth = 4, T_dmate = 0, T_dmn = 600;
+  let T_gdepth = 4, T_dmate = 0, T_dmn = 600, T_gleft = 0.5, T_gres = 0.2, T_gnear = 150, T_gsmp = 0.1, T_gback = true;
   function setTune(t) {
     const u = Object.assign({}, TUNE_DEFAULT, t || {});
     T_se = !!u.se; T_chk = u.chk | 0; T_m1d = Number.isInteger(u.m1d) ? u.m1d : 3;
@@ -3535,6 +3598,11 @@ select {
     T_gdepth = Number.isInteger(u.gdepth) && u.gdepth >= 1 ? u.gdepth : 4;
     T_dmate = Number.isInteger(u.dmate) && u.dmate >= 1 ? u.dmate : 0;
     T_dmn = Number.isInteger(u.dmn) && u.dmn >= 50 ? u.dmn : 600;
+    T_gleft = typeof u.gleft === 'number' && u.gleft >= 0 && u.gleft <= 1 ? u.gleft : 0.5;
+    T_gres = typeof u.gres === 'number' && u.gres >= 0 && u.gres <= 0.5 ? u.gres : 0.2;
+    T_gnear = typeof u.gnear === 'number' && u.gnear >= 0 ? u.gnear : 150;
+    T_gsmp = typeof u.gsmp === 'number' && u.gsmp >= 0 && u.gsmp <= 0.2 ? u.gsmp : 0.1;
+    T_gback = u.gback !== false;
   }
   const excluded = new Int32Array(MAX_PLY + 4);   // singular extension の確かめで外す手
 
@@ -3769,13 +3837,7 @@ select {
         sc = -negamax(nd, -alpha - 1, -alpha, 1, gc, true);
         if (sc > alpha && sc < beta && !stopFlag) sc = -negamax(nd, -beta, -alpha, 1, gc, true);
       }
-      // 相手の詰みの見張り：この深さでいちばん良くなりそうな手（先頭の手か、alpha を超えた手）を指したあと、
-      // 相手に王手の連続の詰みがあれば、詰まされる値に替える（読みが詰みを読み切っている手・勝ちの詰みの手は調べない）
-      if (gOn && gk === undefined && !stopFlag && rootDepth >= gMinDepth && sc > best && (i === 0 || sc > alpha)
-        && sc > -MATE_BOUND && sc < MATE_BOUND) {
-        const len = guardCheck(p, m, false);
-        if (len > 0) { gOver.set(m, sc); sc = -MATE + 1 + len; pvLen[1] = 0; }
-      }
+      // （相手の詰みの見張りは、深さを読み切ったときの最善手だけを調べる。search の中の (1)〜(3)。alpha を超えた手をその場では調べない）
       p.unmakeMove(m);
       if (stopFlag) break;
       rootScores[i] = sc;
@@ -4149,6 +4211,25 @@ select {
     if (a.depth !== b.depth) return a.depth > b.depth;
     return !b.main && a.score > b.score;
   }
+  // 主：自分の結果 main と手伝いの結果 res から、指す手を選ぶ（smpBetter でいちばん良い結果）。手伝いの手は、この局面の合法手の中にあって
+  // 読み筋の1手目と同じものだけ使う。相手の詰みの見張りで詰まされると分かった手は使わない（手伝いは見張りをしないので、その手を良いと読んでいることがある）
+  function smpChoose(main, res) {
+    let cand = main;
+    for (const h of res) {
+      let ok = false;
+      for (let i = 0; i < rootN; i++) if (rootMoves[i] === h.move) { ok = true; break; }
+      if (!ok || !h.pv.length || h.pv[0] !== h.move) continue;
+      if (gOn && gMap.get(h.move) > 0) continue;
+      if (smpBetter(h, cand)) cand = h;
+    }
+    return cand;
+  }
+  // 主：手伝いの今の結果（読んでいる途中でも、読み切った深さの分）を覗く。手伝いは止めない
+  function smpPeek(seq) {
+    const res = [];
+    for (let k = 1; k < SMP_MAX; k++) { const r = smpReadSlot(k, seq); if (r) res.push(r); }
+    return res;
+  }
 
   // 手伝い：仕事を待ち、出たら読む（戻らない。止めるのは本体の terminate か smpQuit）
   function smpHelperLoop() {
@@ -4258,6 +4339,13 @@ select {
       r.mate = 0;
       return r;
     }
+    // 手伝い：主の相手の詰みの見張りが詰まされると分かった手（仕事の ban）は読まない（ほかに手が残るときだけ）
+    if (H && Array.isArray(H.ban) && H.ban.length) {
+      const ban = new Set(H.ban);
+      let k = 0;
+      for (let i = 0; i < rootN; i++) if (!ban.has(moveToUsi(rootMoves[i]))) rootMoves[k++] = rootMoves[i];
+      if (k > 0) rootN = k;
+    }
     if (!inCheck && !H) {
       const mm = p.mateIn1();
       if (mm) {
@@ -4295,26 +4383,29 @@ select {
       }
     }
     // 相手の詰みの見張り（上の「相手の詰みの見張り」の節）：段階の設定 mateGuard（Lv4〜7）か、引数の mateGuard で使う。
-    // 予算は持ち時間の guardShare（Lv4〜7 は 20%。渡されなければ 15%）。1回に使うのはその半分まで（読みの終わりの調べ直しは残り全部）。
-    // 局面数で区切るときは局面数の guardShare（詰み探索の局面数）。
+    // (1) の予算は持ち時間の guardShare（Lv4〜7 は 20%。渡されなければ 15%）。1回に使うのはその半分まで。
+    // 局面数で区切るときは局面数の guardShare（詰み探索の局面数。読みの局面数には数えない）。
     // 揺らぎのある段階・合法手が1つのとき・手伝いは使わない
     const wantGuard = o.mateGuard != null ? !!o.mateGuard : !!(lv && lv.mateGuard);
     if (!H && wantGuard && rootN > 1 && noiseAmp === 0 && !fullRoot) {
       const gm = getMate();
       if (gm && typeof gm.solvePosition === 'function') {
         const share = typeof o.guardShare === 'number' && o.guardShare > 0 ? Math.min(o.guardShare, 0.5) : lv && lv.guardShare ? lv.guardShare : 0.15;
-        gOn = true; gMap = new Map(); gOver = new Map();
-        gChecks = 0; gMated = 0; gNodes = 0; gMs = 0;
+        gOn = true; gShare = share; gMap = new Map(); gOver = new Map(); gSpent = new Map(); gScore = new Map(); gShort = new Set();
+        gChecks = 0; gMated = 0; gNodes = 0; gMs = 0; gSwap = 0;
         gMinDepth = T_gdepth;
         gTimed = hasTm || !hasMn;
+        gT0 = t0; gTime = timeMs; gEnd = t0 + timeMs * (1 + GUARD_EXTRA);
+        gNodeCap = hasMn ? mnIn : Infinity; gExtraNodes = 0;
         gLeftMs = gTimed ? timeMs * share : Infinity;
         gPerMs = gLeftMs * 0.5;
-        gExtraMs = gTimed ? timeMs * 0.05 : Infinity;
         gLeftNodes = hasMn ? Math.round(mnIn * share) : Infinity;
         gPerNodes = hasMn ? Math.round(gLeftNodes * 0.5) : 3000000;
         if (!useMate && typeof gm.nextGeneration === 'function') gm.nextGeneration();
       }
     }
+    // 読みの上限：ふだんは持ち時間。見張りが「指そうとしている手」を詰まないと分からないまま深さを読み終えたら、持ち時間の gres だけ前に倒す（(3) の時間を残す）
+    const hardFull = hardLimit, hardRes = t0 + timeMs * (1 - T_gres);
     // 静かな順の初期並び：取る手・成る手を前へ
     for (let i = 0; i < rootN; i++) {
       const m = rootMoves[i], cap = (m >>> 22) & 31;
@@ -4331,16 +4422,41 @@ select {
 
     // 並列の読み（主）：段階の設定 parallel（Lv4〜7）か、threads（2 以上）を渡されたとき、待っている手伝いに同じ局面を読んでもらう。
     // 揺らぎのある段階・評価を差し替えているとき（setEvaluator。手伝いには渡らない）・合法手が1つのときは使わない
-    let smpSeq = 0, nThreads = 1;
+    let smpSeq = 0, nThreads = 1, smpJob = null, smpOldNodes = 0;
     if (!H && smpRole === 'main' && userEv === null && noiseAmp === 0 && !fullRoot && blunder === 0 && rootN > 1) {
       const want = o.threads != null ? Math.floor(Number(o.threads)) : (lv && lv.parallel ? SMP_MAX : 1);
       if (want > 1) {
         const live = smpLiveHelpers().slice(0, Math.min(want, SMP_MAX) - 1);
         if (live.length) {
-          smpSeq = smpWriteJob({ startSfen: o.startSfen || STARTPOS, moves: mv, level: lv ? lv.level : null, learned: wantLearned,
-            tune: o.tune || null, maxDepth, cap: Math.min(timeMs, 600000) + 3000, clear: !!o.clearHash, gen: ttGen, maxIdx: live[live.length - 1] });
+          smpJob = { startSfen: o.startSfen || STARTPOS, moves: mv, level: lv ? lv.level : null, learned: wantLearned,
+            tune: o.tune || null, maxDepth, cap: Math.min(timeMs, 600000) + 3000, clear: !!o.clearHash, gen: ttGen, maxIdx: live[live.length - 1] };
+          smpSeq = smpWriteJob(smpJob);
           if (smpSeq) nThreads = 1 + live.length;
         }
+      }
+    }
+    // 並列の読み（主）：相手の詰みの見張りが詰まされる手を見つけたら、その手を外した仕事を手伝いに出し直す（ban）。
+    // 手伝いは見張りをしないので、そのままだと外した手を最善と読み続け、結果が使えなくなるため（共有の置換表があるので、読み直しはすぐ追いつく）
+    const smpBan = () => {
+      if (!smpSeq || !gOn) return;
+      const ban = [];
+      for (const [m, v] of gMap) if (v > 0) ban.push(moveToUsi(m));
+      if (!ban.length || (smpJob.ban && smpJob.ban.length === ban.length)) return;
+      smpOldNodes += smpHelperNodes(smpSeq);
+      Atomics.store(shCtl, C_STOP, smpSeq);
+      const left = Math.max(100, t0 + timeMs - now());
+      smpJob = Object.assign({}, smpJob, { ban, clear: false, cap: Math.min(left, 600000) + 3000 });
+      delete smpJob.seq;
+      const s = smpWriteJob(smpJob);
+      if (s) smpSeq = s;
+    };
+    // 相手の詰みの見張り (1) の予算：並列で読むときは、主が見張りをしている間も手伝いが読み続けるので、2本目より後の手伝い1本ごとに gsmp を足す（40% まで。
+    // 2本では主が読みの半分を受け持つので足さない）
+    if (gOn && nThreads > 1) {
+      const sh = Math.min(GUARD_SMP_MAX, gShare + T_gsmp * Math.max(0, nThreads - 2));
+      if (sh > gShare) {
+        if (gTimed) { gLeftMs = timeMs * sh; gPerMs = gLeftMs * 0.5; }
+        else { gLeftNodes = Math.round(mnIn * sh); gPerNodes = Math.round(gLeftNodes * 0.5); }
       }
     }
 
@@ -4349,6 +4465,72 @@ select {
     // 時間の使い方（tm）：最善手が変わった回数（古いものほど軽く）と、評価の下がり方で、次の深さを始める上限を動かす
     let changes = 0, prevBest = 0, prevScore = 0, stableIters = 0;
     let smpOut = null;
+
+    // ===== 相手の詰みの見張り（search の中の部分。上の「相手の詰みの見張り」の (1)〜(3)）=====
+    let redo = false;     // 主の最善手が詰まされると分かったので、1つ浅い深さから読み直す（窓を広げて。guardRedo）
+    let doneBest = null;  // 最後に読み切った深さの最善手 { move, score, depth }（読みのあと (3) で、途中の深さの手が分からないままのときに戻る先）
+    let gPick = null;     // (2) で決めた、詰まないと分かった手への替え { move, score, depth }
+    // 「分からない」手 m（点 sc）の代わりに、詰まないと分かった手で点が sc − gnear 以上の手を探す（無ければ null）。
+    // verify なら、その手の点が sc − gnear 以上かを、最後に読み切った深さの null window で読んで確かめる（時間が残っているとき。(2) から）。
+    // verify でなければ読まずに、調べたときの点（gScore）と最後の深さの並びの値（上限）がどちらも sc − gnear 以上の手（(3) から）
+    const nearSafe = (m, sc, verify) => {
+      const thr = sc - T_gnear;
+      const list = [];
+      for (const [s, v] of gMap) if (v === 0 && s !== m && gScore.has(s) && gScore.get(s) >= thr - T_gnear) list.push(s);
+      list.sort((a, b) => gScore.get(b) - gScore.get(a));
+      for (let j = 0; j < list.length && j < 2; j++) {
+        const s = list[j];
+        let ix = -1;
+        for (let i = 0; i < rootN; i++) if (rootMoves[i] === s) { ix = i; break; }
+        if (ix < 0) continue;
+        if (verify) {
+          if (bestDepth < 2 || !(now() < hardLimit)) return null;
+          const gc = p.givesCheck(s);
+          p.makeMove(s);
+          const v = -negamax(bestDepth - 1 + (gc ? 1 : 0), -thr, -thr + 1, 1, gc, true);
+          p.unmakeMove(s);
+          if (stopFlag) return null;
+          if (v >= thr) return { move: s, score: v, depth: bestDepth };
+        } else if (gScore.get(s) >= thr && rootScores[ix] >= thr) {
+          return { move: s, score: Math.min(gScore.get(s), rootScores[ix]), depth: bestDepth };
+        }
+      }
+      return null;
+    };
+    // 主の最善手が詰まされると分かったとき：根の手を並べ替えて（詰まされると分かった手は後ろへ、残りは最後に読み切った深さの値〔先頭の手のほかは上限〕の高い順）、
+    // 1つ浅い深さから読み直す（窓を広げて）。同じ深さをいきなり読み直すと、時間切れで途中で切れたとき、読んだ数手の中から選ぶことになるため。
+    // 返り値は次に読む深さの1つ前（for の d++ で、1つ浅い深さになる）
+    const guardRedo = (d) => {
+      const idx = [];
+      for (let i = 0; i < rootN; i++) idx.push(i);
+      const mated = (i) => gMap.get(rootMoves[i]) > 0;
+      idx.sort((a, b) => (mated(a) - mated(b)) || (rootScores[b] - rootScores[a]) || (a - b));
+      const mm = idx.map((i) => rootMoves[i]), ss = idx.map((i) => rootScores[i]);
+      for (let i = 0; i < rootN; i++) { rootMoves[i] = mm[i]; rootScores[i] = ss[i]; }
+      bestMove = rootMoves[0]; bestScore = rootScores[0] > -MATE_BOUND && rootScores[0] < MATE_BOUND ? rootScores[0] : bestScore;
+      bestPv = [moveToUsi(bestMove)];
+      redo = true;
+      return Math.max(0, d - 2);
+    };
+    // (2) 時間の使い方で指すと決めたとき：指そうとしている手（並列なら手伝いの結果も合わせて選ぶ手）を、残った持ち時間の半分で調べる。
+    // 主の最善手が詰まされると分かったら true（guardRedo で1つ浅い深さから読み直す）。手伝いの手が詰まされると分かったら選び直して続ける。
+    // 調べても分からなければ、詰まないと分かった手で点が近い手を読んで確かめ、あれば替える（gPick）
+    const guardStop = () => {
+      if (!gOn) return false;
+      for (let tries = 0; tries < 8; tries++) {
+        const main = { move: bestMove, depth: bestDepth, score: bestScore, main: true };
+        const c = smpSeq ? smpChoose(main, smpPeek(smpSeq)) : main;
+        if (!(Math.abs(c.score) < MATE_BOUND)) return false;   // 読みが詰みを読み切った手は調べない
+        const v = guardLeft(p, c.move, c.score, nodes);
+        if (v === 0) return false;
+        if (v > 0) { smpBan(); if (c.move === bestMove) return true; continue; }
+        if (smpSeq && !c.main && gMap.get(bestMove) === 0) return false;   // 読みのあとで主の手に替わる（並列の決まり。(3)）
+        if (guardRisky()) gPick = nearSafe(c.move, c.score, true);
+        return false;
+      }
+      return false;
+    };
+
     try {
     for (let d = 1; d <= depthCap; d++) {
       // 手伝い：手伝いごとに決まった深さを飛ばす（深さ 1 は必ず読む）
@@ -4356,7 +4538,8 @@ select {
       rootDepth = d;
       canStop = H ? true : d > 1;
       let alpha = -INF, beta = INF, delta = 80;
-      if (d >= 4 && !fullRoot && Math.abs(bestScore) < MATE_BOUND) { alpha = bestScore - delta; beta = bestScore + delta; }
+      if (d >= 4 && !fullRoot && !redo && Math.abs(bestScore) < MATE_BOUND) { alpha = bestScore - delta; beta = bestScore + delta; }
+      redo = false;
       let sc;
       partialMove = 0;
       for (;;) {
@@ -4383,6 +4566,21 @@ select {
         if (mh !== null && d >= Math.abs(mh) + 2) break;
         continue;
       }
+      // 相手の詰みの見張り (1)：この深さの最善手（指そうとしている手）を調べる。詰まされるなら、同じ深さを読み直して次に良い手を選ぶ
+      if (gOn && d >= gMinDepth && Math.abs(sc) < MATE_BOUND) {
+        if (guardIter(p, bestMove, sc) > 0) { smpBan(); d = guardRedo(d); continue; }
+        let cm = bestMove;
+        if (smpSeq) {
+          // 並列：手伝いの結果も合わせて選ぶ手が主の手と違えば、それも調べる（詰まされるなら手伝いに出し直す）
+          const c = smpChoose({ move: bestMove, depth: d, score: sc, main: true }, smpPeek(smpSeq));
+          if (c.move !== bestMove && Math.abs(c.score) < MATE_BOUND) {
+            if (guardIter(p, c.move, c.score) > 0) smpBan(); else cm = c.move;
+          }
+        }
+        // 指そうとしている手が詰まないと分かっておらず、危ない（guardRisky）なら、読みの上限を前に倒す（読みのあとに調べる時間 (3) を残す）
+        if (gTimed) hardLimit = gMap.get(cm) === 0 || !guardRisky() ? hardFull : hardRes;
+        doneBest = { move: bestMove, score: sc, depth: d, main: true };
+      }
       bestPv = [];
       for (let j = 0; j < pvLen[0]; j++) bestPv.push(moveToUsi(pvTab[j]));
       if (!bestPv.length || bestPv[0] !== moveToUsi(bestMove)) bestPv = [moveToUsi(bestMove)];
@@ -4390,7 +4588,7 @@ select {
       const el = now() - t0;
       const elN = hasMn ? nodes / mnIn : 0;
       if (o.onInfo) {
-        const tn = smpSeq ? nodes + smpHelperNodes(smpSeq) : nodes;   // 並列のときは全員の局面数
+        const tn = smpSeq ? nodes + smpOldNodes + smpHelperNodes(smpSeq) : nodes;   // 並列のときは全員の局面数
         o.onInfo({ depth: d, score: bestScore, mate: mateOf(bestScore), nodes: tn, nps: Math.round(tn * 1000 / Math.max(1, el)), pv: bestPv.slice(), timeMs: Math.round(el) });
       }
       const mt = mateOf(bestScore);
@@ -4406,9 +4604,9 @@ select {
         prevBest = bestMove; prevScore = bestScore;
         let target = 0.32 * f;
         if (target > 0.8) target = 0.8;
-        // 指す前に、相手の詰みの見張りが分からないままの手なら残りの予算で調べ直す。詰まされると分かったら読みを続ける
-        if (frac > target) { if (guardRecheck(p, bestMove, bestScore)) continue; break; }
-      } else if (el > softLimit || elN > 0.6) { if (guardRecheck(p, bestMove, bestScore)) continue; break; }
+        // 指す前に、相手の詰みの見張り (2)。指そうとしている手が詰まされると分かったら、同じ深さを読み直す
+        if (frac > target) { if (guardStop()) { d = guardRedo(d); continue; } break; }
+      } else if (el > softLimit || elN > 0.6) { if (guardStop()) { d = guardRedo(d); continue; } break; }
     }
     } finally {
       // 並列の読み（主）：手伝いを止め、結果を集める（例外のときも必ず止める）
@@ -4419,76 +4617,58 @@ select {
     // 本体から「止めて」が来たとき（並列の主。待った・新しい対局など。返す手は捨てられる）は、見張りの最後の確かめをしない
     if (gOn && abortId !== 0 && shCtl !== null && Atomics.load(shCtl, C_ABORT) >= abortId) gOn = false;
 
-    // 並列の読み（主）：いちばん深く読み切った結果を選ぶ。手伝いの手は、この局面の合法手の中にあるものだけ使う
-    if (smpOut) {
-      let cand = { depth: bestDepth, score: bestScore, main: true }, pick = null;
-      for (const h of smpOut.res) {
-        let ok = false;
-        for (let i = 0; i < rootN; i++) if (rootMoves[i] === h.move) { ok = true; break; }
-        if (!ok || !h.pv.length || h.pv[0] !== h.move) continue;
-        // 相手の詰みの見張りで、詰まされると分かった手は使わない（手伝いは見張りをしないので、その手を良いと読んでいることがある）
-        if (gOn && gMap.get(h.move) > 0) continue;
-        if (smpBetter(h, cand)) { cand = h; pick = h; }
-      }
-      // 主が調べていない手を選んだときは、ここで調べる（持ち時間の 5% までなら超えてよい）。詰まされるなら主の結果のまま。
-      // 調べ切れなかった（分からない）ときも、主の手が「詰まされない」と分かっていれば主の結果のまま
-      if (pick && gOn && pick.move !== bestMove && pick.score < MATE_BOUND) {
-        const len = guardFinal(p, pick.move);
-        if (len > 0 || (len < 0 && gMap.get(bestMove) === 0)) pick = null;
-      }
-      if (pick) {
-        bestMove = pick.move; bestScore = pick.score; bestDepth = pick.depth;
-        bestPv = smpPvUsi(p, pick.pv);
-      }
-      nodes += smpOut.nodes;   // 結果の局面数は全員の合計
-    }
-
-    // 相手の詰みの見張り（指す前の最後の確かめ）：指す手がまだ調べられていないか「分からない」なら、残りの予算で調べる
-    // （時間切れ・局面数の上限で読みが止まったときは、読みの終わりの調べ直しが行われていないため。持ち時間の 5% までなら超えてよい）。
-    // 詰まされると分かったら、詰まされると分かっていない手（読みでも詰まされると読み切っていない手）のうち、最後に読み切った深さの
-    // 並びでいちばん前の手に替えて、それも同じように調べる（点はその手の読みの値。読み筋はその手だけ）。
-    // 点がすでに詰まされる値なら（どの手も詰まされる）、替えない
-    if (gOn && bestScore > -MATE_BOUND && bestScore < MATE_BOUND) {
-      for (let tries = 0; tries < 8; tries++) {
-        if (!(guardFinal(p, bestMove) > 0)) break;
-        gOver.set(bestMove, bestScore);
-        let next = -1;
+    if (gOn) {
+      // 相手の詰みの見張り (3)：指す手を決める。並列なら、いちばん深く読み切った結果（手伝いの手は、この局面の合法手の中にあるものだけ。
+      // 詰まされると分かった手は使わない）。その手が詰まないと分かっていなければ、(3) の残りで調べ、詰まされるなら選び直す。
+      if (!gTimed) gExtraNodes = Math.max(0, gLeftNodes) + Math.max(0, gNodeCap - nodes) * T_gleft + gNodeCap * (GUARD_EXTRA + T_gres);
+      // 主の結果。最善手が詰まされると分かっている（読み直しの途中で止まった・ここで分かった）ときは、詰まされると分かっていない手
+      // （読みでも詰まされると読み切っていない手）のうち、最後に読み切った深さの並びでいちばん前の手（点はその手の並びの値）
+      const mainOf = () => {
+        if (!(gMap.get(bestMove) > 0)) return { move: bestMove, depth: bestDepth, score: bestScore, main: true };
         for (let i = 0; i < rootN; i++) {
           const m = rootMoves[i];
-          if (m === bestMove || gMap.get(m) > 0 || !(rootScores[i] > -MATE_BOUND)) continue;
-          next = i; break;
+          if (gMap.get(m) > 0 || !(rootScores[i] > -MATE_BOUND)) continue;
+          return { move: m, depth: 0, score: Math.min(rootScores[i], MATE_BOUND - 1), main: true, fallback: true };
         }
-        if (next < 0) {
-          // ほかの手もすべて詰まされる：点を詰まされる値にする（いちばん長く粘れる手の値。指す手は下の「どの手も詰まされる」で決める）
-          let bv = -INF;
-          for (let i = 0; i < rootN; i++) {
-            const m = rootMoves[i], gl = gMap.get(m);
-            const v = gl > 0 ? -MATE + 1 + gl : rootScores[i];
-            if (v > bv) { bv = v; bestMove = m; }
-          }
-          bestScore = bv; bestPv = [moveToUsi(bestMove)];
-          break;
+        return null;
+      };
+      let pick = null;
+      if (gPick && gMap.get(gPick.move) === 0) pick = Object.assign({ main: true, near: true }, gPick);
+      for (let tries = 0; !pick && tries < 8; tries++) {
+        const mc = mainOf();
+        const c = smpOut ? smpChoose(mc || { move: 0, depth: -1, score: -INF, main: true }, smpOut.res) : mc;
+        if (!c || !c.move) break;                                          // どの手も詰まされる
+        if (!(Math.abs(c.score) < MATE_BOUND)) { pick = c; break; }         // 読みが詰みを読み切った手は調べない
+        const v = guardLast(p, c.move, c.score);
+        if (v > 0) continue;                                               // 詰まされる：選び直す
+        pick = c;
+        if (v < 0) {
+          // 分からない：並列で主の手が詰まないと分かっていれば主の手（並列の決まり）。危ない（guardRisky）ときは、最後に読み切った深さの最善手が
+          // 詰まないと分かっていればその手（時間切れで止まった途中の深さで抜いた手を、(3) の短い時間でしか調べられなかったとき）。
+          // そうでなければ、詰まないと分かった手で点が近い手（読まずに、調べたときの点と並びの値で比べる）
+          if (!c.main && mc && gMap.get(mc.move) === 0) pick = mc;
+          else if (!guardRisky()) { /* 危なくない：詰まされないものとして指す */ }
+          else if (T_gback && doneBest && doneBest.move !== c.move && gMap.get(doneBest.move) === 0) pick = Object.assign({ back: true }, doneBest);
+          else { const s = nearSafe(c.move, c.score, false); if (s) pick = Object.assign({ main: true, near: true }, s); }
         }
-        bestMove = rootMoves[next]; bestScore = rootScores[next] < MATE_BOUND ? rootScores[next] : bestScore; bestPv = [moveToUsi(bestMove)];
       }
-    }
-
-    // 相手の詰みの見張り：どの手も詰まされる値になったとき（見張りが外した手がある）は、見張りが外した手のうち、
-    // 詰みが 11 手以上の手があればその中で外したときの読みの点がいちばん高い手（見張りが無ければ指していた手に近い。相手が長い詰みを
-    // 見つけなければ、いちばん良い形で続けられる）、なければいちばん長く粘れる手（短い詰みは相手も見つけやすい）を指す。点は詰まされる値のまま
-    if (gOn && gOver.size > 0 && bestScore <= -MATE_BOUND) {
-      let maxLen = 0;
-      for (const m of gOver.keys()) if (gMap.get(m) > maxLen) maxLen = gMap.get(m);
-      const need = Math.min(maxLen, GUARD_LONG);
-      let bm = 0, bv = -INF;
-      for (const [m, v] of gOver) {
-        const len = gMap.get(m);
-        if (len < need) continue;
-        const key = maxLen < GUARD_LONG ? len * 1e6 + v : v;   // 長い詰みが無ければ手数が先、同じ手数なら読みの点
-        if (key > bv) { bv = key; bm = m; }
+      if (pick) {
+        if (pick.near || pick.back) gSwap++;
+        if (!pick.main) { bestMove = pick.move; bestScore = pick.score; bestDepth = pick.depth; bestPv = smpPvUsi(p, pick.pv); }
+        else if (pick.back) { bestMove = pick.move; bestScore = pick.score; bestDepth = pick.depth; bestPv = [moveToUsi(pick.move)]; }
+        else if (pick.move !== bestMove || pick.fallback || pick.near) { bestMove = pick.move; bestScore = pick.score; bestPv = [moveToUsi(pick.move)]; }
       }
-      if (bm !== 0 && bm !== bestMove) { bestMove = bm; bestScore = -MATE + 1 + gMap.get(bm); bestPv = [moveToUsi(bm)]; }
+      // どの手も詰まされる（見張りが外した手がある）：いちばん長く粘れる手（最短の詰みがいちばん長い手）を指す。点はその手の詰まされる値
+      if ((!pick || bestScore <= -MATE_BOUND) && gOver.size > 0) {
+        const L = guardLongest(p);
+        if (L) { bestMove = L.move; bestScore = -MATE + L.plies; bestPv = [moveToUsi(L.move)]; }
+      }
+    } else if (smpOut) {
+      // 並列の読み（主）：いちばん深く読み切った結果を選ぶ。手伝いの手は、この局面の合法手の中にあるものだけ使う
+      const c = smpChoose({ move: bestMove, depth: bestDepth, score: bestScore, main: true }, smpOut.res);
+      if (!c.main) { bestMove = c.move; bestScore = c.score; bestDepth = c.depth; bestPv = smpPvUsi(p, c.pv); }
     }
+    if (smpOut) nodes += smpOut.nodes + smpOldNodes;   // 結果の局面数は全員の合計
 
     // 弱い段階：ときどき次善手
     if (fullRoot && lastScores && blunder > 0 && rootN > 1 && Math.random() < blunder) {
@@ -4502,12 +4682,14 @@ select {
     const r = result(moveToUsi(bestMove), bestScore, bestDepth, bestPv);
     if (useMate) r.mateMs = Math.round(mateMs);
     if (smpOut) r.threads = nThreads;
-    // 相手の詰みの見張りの記録（調べた回数・詰まされると分かった手の数・使った時間と詰み探索の局面数）
-    if (gOn) r.guard = { checks: gChecks, mated: gMated, ms: Math.round(gMs), nodes: gNodes };
+    // 相手の詰みの見張りの記録（調べた回数・詰まされると分かった手の数・使った時間と詰み探索の局面数・
+    // 分からない手を詰まないと分かった手に替えた回数・読みの上限を前に倒したまま終えたか）
+    if (gOn) r.guard = { checks: gChecks, mated: gMated, ms: Math.round(gMs), nodes: gNodes, swap: gSwap, cut: hardLimit < hardFull ? 1 : 0 };
     if (dmSolver !== null) r.dmate = { calls: dmCalls, hits: dmHits, nodes: dmNodes };
-    // 投了は、読みが詰まされることを読み切ったときだけ。見張りが詰まされる手を見つけた search で「どの手も詰まされる」になったときは
-    // 投了せず、見張りが無ければ指していた手を指す（見張りが見つけるのは読みでは届かない長い詰みで、相手が見つけるとは限らない）
-    const guardOnly = gOn && gOver.size > 0 && r.mate !== null && r.mate < 0;
+    // 投了は、読みが詰まされることを読み切ったときだけ。どの手も詰まされるとき、指す手（いちばん長く粘れる手）の詰みを見つけたのが
+    // 見張りで、その詰みが長い（相手の番から GUARD_SEEN 手を超える）なら投了しない（読みでは届かない長い詰みで、相手が見つけるとは限らない）。
+    // 指す手の詰みも読みが読み切っているか、見張りの詰みでも短ければ、今までどおり投了する
+    const guardOnly = gOn && r.mate !== null && r.mate < 0 && gOver.has(bestMove) && -r.mate - 1 > GUARD_SEEN;
     if (guardOnly) r.guardMated = true;
     if (lv && lv.resign && r.mate !== null && r.mate < 0 && !guardOnly) r.bestmove = 'resign';
     gOn = false;

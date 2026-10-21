@@ -6,7 +6,7 @@
  *   fetch    一式の中の物は cache から返す（ページを開くとき・アイコンなど）。無い物だけネットへ。
  *            どちらの応答にも COOP・COEP の見出しを付け直す（クロスオリジン分離。並列の読みのため） */
 'use strict';
-const VERSION = "d33ea2f1e8a0";
+const VERSION = "9b4b899cb726";
 const ASSETS = [
   "./",
   "./index.html",
